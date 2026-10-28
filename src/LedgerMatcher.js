@@ -191,27 +191,78 @@ function resolveFacility(rawFacilityName, facilityMasterList) {
 }
 
 /**
+ * 年度別台帳シートにヘッダー装飾（#0F4C5C）、行列スクロール固定（1行目・5列目E列まで）、
+ * およびN列（返書ステータス）の条件付き書式ルールを適用する
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet
+ */
+function applyLedgerSheetFormatting(sheet) {
+  if (!sheet) return;
+
+  const headers = SANTE_CONFIG.LEDGER_COLUMNS.HEADERS;
+  const headerRange = sheet.getRange(1, 1, 1, headers.length);
+
+  // ヘッダーが未設定の場合は見出し文字列をセット
+  const firstCellVal = String(sheet.getRange(1, 1).getValue() || '').trim();
+  if (!firstCellVal) {
+    headerRange.setValues([headers]);
+  }
+
+  // A1:R1 ヘッダー装飾（ディープティール #0F4C5C / 白太字 / 中央揃え）
+  headerRange
+    .setBackground('#0F4C5C')
+    .setFontColor('#FFFFFF')
+    .setFontWeight('bold')
+    .setHorizontalAlignment('center');
+
+  // 1行目（ヘッダー）と A〜E列（5列目: 患者氏名まで）を常時スクロール固定
+  sheet.setFrozenRows(1);
+  sheet.setFrozenColumns(5);
+
+  // N列（返書ステータス: 14列目）への条件付き書式設定
+  const replyStatusCol = SANTE_CONFIG.LEDGER_COLUMNS.COL_NUM.REPLY_STATUS; // 14 (N列)
+  const maxRows = Math.max(sheet.getMaxRows(), 500);
+  const statusRange = sheet.getRange(2, replyStatusCol, maxRows - 1, 1);
+
+  const uncreatedRule = SpreadsheetApp.newConditionalFormatRule()
+    .whenTextEqualTo(SANTE_CONFIG.REPLY_STATUS.UNCREATED)
+    .setBackground('#F4CCCC')
+    .setRanges([statusRange])
+    .build();
+
+  const completedRule = SpreadsheetApp.newConditionalFormatRule()
+    .whenTextEqualTo(SANTE_CONFIG.REPLY_STATUS.COMPLETED)
+    .setBackground('#D9EAD3')
+    .setRanges([statusRange])
+    .build();
+
+  // 既存の他列ルールは維持しつつ、N列の重複ルールを防いで設定
+  const existingRules = sheet.getConditionalFormatRules() || [];
+  const filteredRules = existingRules.filter((rule) => {
+    const ranges = rule.getRanges();
+    return !ranges.some((r) => r.getColumn() === replyStatusCol);
+  });
+
+  filteredRules.push(uncreatedRule, completedRule);
+  sheet.setConditionalFormatRules(filteredRules);
+}
+
+/**
  * 指定された会計年度の台帳シートを取得する（存在しない場合は新規作成・ヘッダー初期化する）
  * @param {number=} fiscalYear 会計年度（例: 2026）
  * @param {GoogleAppsScript.Spreadsheet.Spreadsheet=} ss
+ * @param {boolean=} forceFormat 既存シートにも強制的にUI固定・条件付き書式を再適用するか
  * @return {GoogleAppsScript.Spreadsheet.Sheet}
  */
-function getOrCreateLedgerSheet(fiscalYear, ss) {
+function getOrCreateLedgerSheet(fiscalYear, ss, forceFormat) {
   const spreadsheet = ss || SpreadsheetApp.getActiveSpreadsheet();
   const sheetName = getLedgerSheetName(fiscalYear);
   let sheet = spreadsheet.getSheetByName(sheetName);
 
   if (!sheet) {
     sheet = spreadsheet.insertSheet(sheetName);
-    const headers = SANTE_CONFIG.LEDGER_COLUMNS.HEADERS;
-    const headerRange = sheet.getRange(1, 1, 1, headers.length);
-    headerRange.setValues([headers]);
-    headerRange
-      .setBackground('#1f4e78')
-      .setFontColor('#ffffff')
-      .setFontWeight('bold')
-      .setHorizontalAlignment('center');
-    sheet.setFrozenRows(1);
+    applyLedgerSheetFormatting(sheet);
+  } else if (forceFormat) {
+    applyLedgerSheetFormatting(sheet);
   }
 
   return sheet;
