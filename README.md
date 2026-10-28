@@ -1,7 +1,7 @@
 # SANTE-BRIDGE (`sante-bridge-liaison-hub`)
-**サンテ溝上病院 地域連携・紹介返書管理＆第一報自動化システム**
+**サンテ溝上病院 地域連携・紹介返書管理＆第一報自動化システム (v2.0.0 - Phase 2)**
 
-Google Workspace (Gemini / Google Sheets / Google Docs / Google Apps Script) と kintone (App ID: 195)・Slack を連携し、医療情報ガイドライン（3省2ガイドライン・HIPAA BAA）準拠の Human-in-the-Loop 体制で地域医療連携業務（前方紹介受入・第一報作成・後方逆紹介・返書消込）を自動化するシステムです。
+Google Workspace (Gemini / Google Sheets / Google Docs / Google Apps Script) と kintone (App ID: 195)・LINE WORKS・Slack を連携し、医療情報ガイドライン（3省2ガイドライン・HIPAA BAA）準拠の Human-in-the-Loop 体制で地域医療連携業務（前方紹介受入・第一報作成・後方逆紹介・返書消込・未返書定期リマインド）を自動化するシステムです。
 
 ---
 
@@ -19,9 +19,10 @@ sante-bridge-liaison-hub/
 └── src/
     ├── Config.js               # 定数・シート定義・PropertiesService秘匿情報管理・Slack通知モジュール
     ├── Code.js                 # エントリポイント(onOpen, onEdit)・JSON横展開・一括実行・列クリア整理
-    ├── LedgerMatcher.js        # 施設マスター名寄せ・年度別台帳管理・5重ロック自動照合エンジン
-    ├── KintoneClient.js        # kintone REST API (App ID: 195) 一括POST/PUT通信・チャンク分割・エラー通知
-    └── DocGenerator.js         # 第一報（受診・入院報告書）Googleドキュメント複製＆プレースホルダー置換生成
+    ├── LedgerMatcher.js        # 施設マスター名寄せ・年度別台帳管理(UI固定/条件付き書式)・5重ロック自動照合
+    ├── KintoneClient.js        # kintone REST API (App ID: 195) 複数トークン連結・Auto-Recovery付POST/PUT通信
+    ├── DocGenerator.js         # 第一報（受診・入院報告書）Googleドキュメント複製＆プレースホルダー置換生成
+    └── ReminderService.js      # 未返書リスト抽出・担当医別グルーピング・LINE WORKS Bot / Slack 定期リマインド通知
 ```
 
 ---
@@ -48,10 +49,18 @@ clasp push
 | `KINTONE_DOMAIN` | kintoneサブドメイン（例: `sante-mizogami.cybozu.com`） | ✅ |
 | `KINTONE_APP_ID` | アプリBのApp ID（デフォルト: `195`） | ✅ |
 | `KINTONE_API_TOKEN` | アプリB（ID: 195）のAPIトークン（レコード閲覧・追加・編集権限） | ✅ |
+| `KINTONE_API_TOKEN_MASTER` | ルックアップ参照元（医療機関・施設マスター）のAPIトークン（カンマ連結送信） | 推奨 |
 | `REPORT_TEMPLATE_DOC_ID` | 第一報GoogleドキュメントのテンプレートID（※メニューから自動生成可能） | ✅ |
 | `REPORT_OUTPUT_FOLDER_ID` | 生成した第一報ドキュメントの保存先GoogleドライブフォルダID | 任意 |
-| `SLACK_WEBHOOK_URL` | エラー・完了通知用 Slack Incoming Webhook URL | 任意 |
+| `SLACK_WEBHOOK_URL` | エラー・完了・リマインド通知用 Slack Incoming Webhook URL | 任意 |
+| `LW_CLIENT_ID` | LINE WORKS Developer Console の Client ID | 任意 |
+| `LW_CLIENT_SECRET` | LINE WORKS Developer Console の Client Secret | 任意 |
+| `LW_SERVICE_ACCOUNT` | LINE WORKS サービスアカウントID (`xxxx.serviceaccount@...`) | 任意 |
+| `LW_PRIVATE_KEY` | LINE WORKS 秘密鍵（PEM形式・改行は `\n` のまま保存可） | 任意 |
+| `LW_BOT_ID` | 通知送信元 LINE WORKS Bot ID | 任意 |
+| `LW_REMINDER_TARGET_ID` | 未返書リマインド送信先のトークルーム（Channel）ID または ユーザーID | 任意 |
 
-### 3. スプレッドシート3タブと第一報テンプレートの初期構築
-1. メニュー **「⚙️ 初期設定・メンテナンス」＞「📋 3タブ初期構築・フォーマット整備」** をクリックすると、`紹介・逆紹介入力`・`2026年度_連携台帳`・`施設マスター` の3タブが自動生成・整形されます。
-2. メニュー **「⚙️ 初期設定・メンテナンス」＞「📄 第一報Googleドキュメント標準テンプレート生成」** をクリックすると、12個のプレースホルダー（`{{報告日}}` 等）を備えた標準テンプレートDocが自動作成され、`REPORT_TEMPLATE_DOC_ID` に自動登録されます。
+### 3. スプレッドシート3タブ・テンプレート・定期トリガーの初期構築
+1. **3タブ整備**: メニュー **「⚙️ 初期設定・メンテナンス ＞ 📋 3タブ初期構築・フォーマット整備」** をクリック（スクロール固定およびN列条件付き書式が自動適用されます）。
+2. **第一報テンプレート生成**: メニュー **「⚙️ 初期設定・メンテナンス ＞ 📄 第一報Googleドキュメント標準テンプレート生成」** をクリック。
+3. **未返書リマインド定期トリガー登録**: メニュー **「⚙️ 初期設定・メンテナンス ＞ ⏰ 未返書リマインド定期トリガー設定（毎週月・木 9:00）」** をクリック。
