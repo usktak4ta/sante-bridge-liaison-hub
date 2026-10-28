@@ -5,7 +5,7 @@
 
 const SANTE_CONFIG = Object.freeze({
   SYSTEM_NAME: 'SANTE-BRIDGE (地域連携・紹介返書管理＆第一報自動化システム)',
-  VERSION: '1.0.0',
+  VERSION: '2.0.0',
 
   // シート名定義
   SHEETS: {
@@ -184,11 +184,13 @@ const SANTE_CONFIG = Object.freeze({
   KINTONE: {
     DEFAULT_APP_ID: '195',
     BATCH_LIMIT: 100, // kintone REST API 1リクエストあたりの最大レコード数
+    MAX_AUTO_RECOVERY_RETRIES: 8, // フィールド未定義エラー時の自動除外リトライ上限
     FIELD_CODES: {
       VISIT_DATE: '受診日',
       PATIENT_ID: '患者ID',
       PATIENT_NAME: '患者氏名',
       PHASE: '連携フェーズ',
+      DIRECTION: '連携方向', // 既存フィールド互換用（前方（紹介・受入） / 後方（逆紹介・送出））
       VISIT_TYPE: '受入・送出形態',
       LOOKUP_KEY: '更新用キー',
       FACILITY_NAME: '連携先施設名',
@@ -206,12 +208,20 @@ const SANTE_CONFIG = Object.freeze({
 
   // PropertiesService のキー名定義
   PROPERTY_KEYS: {
-    KINTONE_DOMAIN: 'KINTONE_DOMAIN',                 // 例: sante-mizogami.cybozu.com
-    KINTONE_APP_ID: 'KINTONE_APP_ID',                 // デフォルト: 195
-    KINTONE_API_TOKEN: 'KINTONE_API_TOKEN',           // アプリ195のAPIトークン（閲覧・追加・編集権限）
-    REPORT_TEMPLATE_DOC_ID: 'REPORT_TEMPLATE_DOC_ID', // 第一報GoogleドキュメントテンプレートID
+    KINTONE_DOMAIN: 'KINTONE_DOMAIN',                   // 例: sante-mizogami.cybozu.com
+    KINTONE_APP_ID: 'KINTONE_APP_ID',                   // デフォルト: 195
+    KINTONE_API_TOKEN: 'KINTONE_API_TOKEN',             // アプリ195のAPIトークン（閲覧・追加・編集権限）
+    KINTONE_API_TOKEN_MASTER: 'KINTONE_API_TOKEN_MASTER', // ルックアップ参照元（医療機関・施設マスター）のAPIトークン
+    REPORT_TEMPLATE_DOC_ID: 'REPORT_TEMPLATE_DOC_ID',   // 第一報GoogleドキュメントテンプレートID
     REPORT_OUTPUT_FOLDER_ID: 'REPORT_OUTPUT_FOLDER_ID', // 生成した第一報ドキュメントの保存先フォルダID
-    SLACK_WEBHOOK_URL: 'SLACK_WEBHOOK_URL',           // エラー・マイルストーン通知用Slack Incoming Webhook URL
+    SLACK_WEBHOOK_URL: 'SLACK_WEBHOOK_URL',             // エラー・マイルストーン通知用Slack Incoming Webhook URL
+    // LINE WORKS Bot (API 2.0) 定期リマインド通知用
+    LW_CLIENT_ID: 'LW_CLIENT_ID',
+    LW_CLIENT_SECRET: 'LW_CLIENT_SECRET',
+    LW_SERVICE_ACCOUNT: 'LW_SERVICE_ACCOUNT',
+    LW_PRIVATE_KEY: 'LW_PRIVATE_KEY',
+    LW_BOT_ID: 'LW_BOT_ID',
+    LW_REMINDER_TARGET_ID: 'LW_REMINDER_TARGET_ID',     // 送信先トークルーム(Channel)ID または ユーザーID
   },
 });
 
@@ -221,9 +231,16 @@ const SANTE_CONFIG = Object.freeze({
  *   kintoneDomain: string,
  *   kintoneAppId: string,
  *   kintoneApiToken: string,
+ *   kintoneApiTokenMaster: string,
  *   reportTemplateDocId: string,
  *   reportOutputFolderId: string,
- *   slackWebhookUrl: string
+ *   slackWebhookUrl: string,
+ *   lwClientId: string,
+ *   lwClientSecret: string,
+ *   lwServiceAccount: string,
+ *   lwPrivateKey: string,
+ *   lwBotId: string,
+ *   lwReminderTargetId: string
  * }}
  */
 function getSecretConfig() {
@@ -234,9 +251,16 @@ function getSecretConfig() {
     kintoneDomain: (props.getProperty(keys.KINTONE_DOMAIN) || '').trim(),
     kintoneAppId: (props.getProperty(keys.KINTONE_APP_ID) || SANTE_CONFIG.KINTONE.DEFAULT_APP_ID).trim(),
     kintoneApiToken: (props.getProperty(keys.KINTONE_API_TOKEN) || '').trim(),
+    kintoneApiTokenMaster: (props.getProperty(keys.KINTONE_API_TOKEN_MASTER) || '').trim(),
     reportTemplateDocId: (props.getProperty(keys.REPORT_TEMPLATE_DOC_ID) || '').trim(),
     reportOutputFolderId: (props.getProperty(keys.REPORT_OUTPUT_FOLDER_ID) || '').trim(),
     slackWebhookUrl: (props.getProperty(keys.SLACK_WEBHOOK_URL) || '').trim(),
+    lwClientId: (props.getProperty(keys.LW_CLIENT_ID) || '').trim(),
+    lwClientSecret: (props.getProperty(keys.LW_CLIENT_SECRET) || '').trim(),
+    lwServiceAccount: (props.getProperty(keys.LW_SERVICE_ACCOUNT) || '').trim(),
+    lwPrivateKey: (props.getProperty(keys.LW_PRIVATE_KEY) || '').trim(),
+    lwBotId: (props.getProperty(keys.LW_BOT_ID) || '').trim(),
+    lwReminderTargetId: (props.getProperty(keys.LW_REMINDER_TARGET_ID) || '').trim(),
   };
 }
 
@@ -251,9 +275,16 @@ function initScriptPropertiesTemplate() {
     [SANTE_CONFIG.PROPERTY_KEYS.KINTONE_DOMAIN]: 'your-subdomain.cybozu.com',
     [SANTE_CONFIG.PROPERTY_KEYS.KINTONE_APP_ID]: SANTE_CONFIG.KINTONE.DEFAULT_APP_ID,
     [SANTE_CONFIG.PROPERTY_KEYS.KINTONE_API_TOKEN]: '',
+    [SANTE_CONFIG.PROPERTY_KEYS.KINTONE_API_TOKEN_MASTER]: '',
     [SANTE_CONFIG.PROPERTY_KEYS.REPORT_TEMPLATE_DOC_ID]: '',
     [SANTE_CONFIG.PROPERTY_KEYS.REPORT_OUTPUT_FOLDER_ID]: '',
     [SANTE_CONFIG.PROPERTY_KEYS.SLACK_WEBHOOK_URL]: '',
+    [SANTE_CONFIG.PROPERTY_KEYS.LW_CLIENT_ID]: '',
+    [SANTE_CONFIG.PROPERTY_KEYS.LW_CLIENT_SECRET]: '',
+    [SANTE_CONFIG.PROPERTY_KEYS.LW_SERVICE_ACCOUNT]: '',
+    [SANTE_CONFIG.PROPERTY_KEYS.LW_PRIVATE_KEY]: '',
+    [SANTE_CONFIG.PROPERTY_KEYS.LW_BOT_ID]: '',
+    [SANTE_CONFIG.PROPERTY_KEYS.LW_REMINDER_TARGET_ID]: '',
   };
 
   Object.keys(defaults).forEach((key) => {
