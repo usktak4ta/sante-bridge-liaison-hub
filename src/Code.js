@@ -13,12 +13,14 @@ function onOpen() {
     .addItem('📝 第一報ドキュメントのみ先行生成', 'executeFirstReportGenerationOnly')
     .addItem('🔍 全列の5重ロック再照合', 'reRunFiveLockMatchingForAllColumns')
     .addSeparator()
+    .addItem('📢 未返書リストを今すぐ通知（LINE WORKS / Slack）', 'sendUnrepliedRemindersManual')
     .addItem('🧹 送信完了・処理済列のクリア整理', 'clearCompletedColumns')
     .addSeparator()
     .addSubMenu(
       ui
         .createMenu('⚙️ 初期設定・メンテナンス')
         .addItem('📋 3タブ初期構築・フォーマット整備', 'setupAllSheets')
+        .addItem('⏰ 未返書リマインド定期トリガー設定（毎週月・木 9:00）', 'setupReminderScheduleTrigger')
         .addItem('📄 第一報Googleドキュメント標準テンプレート生成', 'handleCreateDefaultTemplateMenu')
         .addItem('🔑 スクリプトプロパティ初期化', 'initScriptPropertiesTemplate')
         .addItem('🔔 Slack疎通テスト通知', 'testSlackWebhookConnection')
@@ -1017,10 +1019,16 @@ function setupAllSheets() {
 
   inputSheet.setColumnWidth(1, 25);  // A列（余白）
   inputSheet.setColumnWidth(2, 210); // B列（項目ラベル）
-  inputSheet.setFrozenColumns(2);
+  inputSheet.setFrozenColumns(2);    // A〜B列（項目ラベル列）を固定
+  inputSheet.setFrozenRows(4);       // 1〜4行目（JSON貼付枠 C2:C3 ＆ ステータス行）を上部に常時固定
 
-  // 2. タブ②: 当年度_連携台帳（例: 2026年度_連携台帳）
-  getOrCreateLedgerSheet(getFiscalYear(), ss);
+  // 2. タブ②: 当年度_連携台帳（例: 2026年度_連携台帳）の生成・UI固定・条件付き書式適用
+  const currentFy = getFiscalYear();
+  getOrCreateLedgerSheet(currentFy, ss, true);
+  const prevLedger = ss.getSheetByName(getLedgerSheetName(currentFy - 1));
+  if (prevLedger) {
+    applyLedgerSheetFormatting(prevLedger);
+  }
 
   // 3. タブ③: 施設マスター
   let masterSheet = ss.getSheetByName(SANTE_CONFIG.SHEETS.FACILITY_MASTER);
