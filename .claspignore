@@ -1,0 +1,6 @@
+# clasp push 時に除外するファイル
+**/**
+!appsscript.json
+!src/**/*.js
+!src/**/*.gs
+!src/**/*.html
