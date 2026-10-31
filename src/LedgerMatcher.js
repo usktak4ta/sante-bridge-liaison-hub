@@ -112,7 +112,9 @@ function loadFacilityMasterList(ss) {
  *   officialName: string,
  *   address: string,
  *   faxNumber: string,
- *   isMatched: boolean
+ *   isMatched: boolean,
+ *   matchType: 'exact'|'core'|'partial'|'none',
+ *   candidates: Array<{officialName: string, lookupKey: string}>
  * }}
  */
 function resolveFacility(rawFacilityName, facilityMasterList) {
@@ -124,6 +126,8 @@ function resolveFacility(rawFacilityName, facilityMasterList) {
       address: '',
       faxNumber: '',
       isMatched: false,
+      matchType: 'none',
+      candidates: [],
     };
   }
 
@@ -141,6 +145,8 @@ function resolveFacility(rawFacilityName, facilityMasterList) {
         address: item.address,
         faxNumber: item.faxNumber,
         isMatched: true,
+        matchType: 'exact',
+        candidates: [],
       };
     }
   }
@@ -156,6 +162,8 @@ function resolveFacility(rawFacilityName, facilityMasterList) {
           address: item.address,
           faxNumber: item.faxNumber,
           isMatched: true,
+          matchType: 'core',
+          candidates: [],
         };
       }
     }
@@ -163,20 +171,29 @@ function resolveFacility(rawFacilityName, facilityMasterList) {
 
   // Step 3: 部分一致（2文字以上の場合のみ）
   if (coreInput.length >= 2) {
+    const candidates = [];
     for (let i = 0; i < list.length; i++) {
       const item = list[i];
       const matched = item.coreCandidates.some(
         (cand) => cand.length >= 2 && (cand.includes(coreInput) || coreInput.includes(cand))
       );
       if (matched) {
-        return {
-          lookupKey: item.lookupKey,
+        candidates.push({
           officialName: item.officialName,
-          address: item.address,
-          faxNumber: item.faxNumber,
-          isMatched: true,
-        };
+          lookupKey: item.lookupKey,
+        });
       }
+    }
+    if (candidates.length > 0) {
+      return {
+        lookupKey: '',
+        officialName: trimmedInput,
+        address: '',
+        faxNumber: '',
+        isMatched: false,
+        matchType: 'partial',
+        candidates: candidates,
+      };
     }
   }
 
@@ -187,6 +204,8 @@ function resolveFacility(rawFacilityName, facilityMasterList) {
     address: '',
     faxNumber: '',
     isMatched: false,
+    matchType: 'none',
+    candidates: [],
   };
 }
 
@@ -363,10 +382,7 @@ function isLock2FacilityMatched(inputFacility, ledgerLookupKey, ledgerFacilityNa
   const coreLedger = normalizeFacilityCoreName(ledgerResolved.officialName || ledgerFacilityName);
 
   if (!coreInput || !coreLedger) return false;
-  if (coreInput === coreLedger) return true;
-
-  // 部分一致（includes）
-  return coreInput.includes(coreLedger) || coreLedger.includes(coreInput);
+  return coreInput === coreLedger;
 }
 
 /**

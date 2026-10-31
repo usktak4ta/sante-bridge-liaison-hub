@@ -439,11 +439,24 @@ function sendLineWorksBotMessage(plainTextMessage) {
       return { sent: true };
     }
     const errText = res.getContentText();
-    notifySlackError(`LINE WORKS Bot送信エラー (HTTP ${status})`, errText, {
-      botId: secret.lwBotId,
-      targetId: secret.lwReminderTargetId,
-    });
-    throw new Error(`LINE WORKS Bot送信エラー (HTTP ${status}): ${errText}`);
+    let errorCode = 'UNKNOWN';
+    try {
+      const parsedErr = JSON.parse(errText);
+      if (parsedErr && (parsedErr.code || parsedErr.error)) {
+        errorCode = String(parsedErr.code || parsedErr.error);
+      }
+    } catch (_) {
+      // 応答本文はSlackに送らない
+    }
+    notifySlackError(
+      `LINE WORKS Bot送信エラー (HTTP ${status})`,
+      `HTTP ${status} / code: ${errorCode}`,
+      {
+        httpStatus: String(status),
+        errorCode: errorCode,
+      }
+    );
+    throw new Error(`LINE WORKS Bot送信エラー (HTTP ${status}, code: ${errorCode})`);
   }
 
   return { sent: true };
@@ -474,16 +487,16 @@ function executeUnrepliedReminderNotification() {
     Logger.log(`LINE WORKS送信エラー: ${lwErr.message}`);
   }
 
-  // Slack Webhook が設定されている場合は Slack にも同時通知
+  // Slack Webhook が設定されている場合は件数のみ通知（氏名・ID・施設名・医師名は送らない）
+  const slackSummaryText = `返書未作成 ${reportData.totalCount}件（うち期限超過 ${reportData.over14DaysCount}件）。詳細はLINE WORKSを確認`;
   const slackSent = sendSlackNotification(
     '紹介患者 返書未作成リマインド',
-    messageText,
+    slackSummaryText,
     reportData.over14DaysCount > 0 ? 'WARNING' : 'INFO',
     {
       未作成合計: `${reportData.totalCount}件`,
       '14日以上経過(🚨)': `${reportData.over14DaysCount}件`,
       '7〜13日経過(⚠️)': `${reportData.over7DaysCount}件`,
-      対象医師数: `${reportData.groupedByDoctor.length}名`,
     }
   );
 
@@ -530,7 +543,9 @@ function sendUnrepliedRemindersManual() {
     '📢 未返書リマインド完了',
     8
   );
-  Logger.log(result.messageText);
+  Logger.log(
+    `返書未作成 ${result.totalCount}件（うち期限超過 ${result.over14DaysCount}件 / 7〜13日経過 ${result.over7DaysCount}件）`
+  );
 }
 
 /**
