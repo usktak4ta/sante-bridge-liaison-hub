@@ -5,6 +5,21 @@ Google Workspace (Gemini / Google Sheets / Google Docs / Google Apps Script) と
 
 ---
 
+## 🔒 コンプライアンス・契約・セキュリティの大前提
+
+1. **Google AI Studioは「BAA対象外」であり、患者情報（PHI）の送信は厳禁**
+   - Google AI Studio（開発者向けプラットフォーム）は、Google CloudのHIPAA BAAなどの「対象サービス（Covered Services）」には含まれません。そのため、Google AI Studioへの患者情報（PHI）の送信およびAPIキーの利用は厳禁です。
+2. **BAAが契約上保証される対象サービス（Workspace Gem / Vertex AI）のみを使用**
+   - 厳格なコンプライアンス（BAAの適用、データ処理追加条項の適用、入力データのモデル学習への利用禁止など）が契約上保証されるのは、**Google Workspace（有償版）標準のGemini画面（Gem）**、または**Google Cloudプラットフォーム上で提供される「Vertex AI」経由のGemini API**のみです。
+   - 本システムでは、診療情報提供書PDFの読み取りはGoogle Workspace標準のWeb UI（Gem）で行い、出力されたJSONをスプレッドシートの `C2` セルへ貼り付ける方式を採用しています。
+3. **決済・アカウント状態の前提**
+   - 現在のメインのお支払い方法は**クレジットカード**に設定されており、現在のアカウント状態のままでは**請求書払い（Invoice）での利用はできない**前提です。
+4. **BAA対象外ツール（Slack・GAS標準ログ）への患者情報（PHI）出力禁止と誤FAX防止設計**
+   - BAA対象外のSlackおよびGAS標準ログ（`Logger.log`）には、患者氏名・紹介元施設名・医師名・レスポンス本文などの実データを一切出力せず、件数や安全なメタ情報のみを出力する設計です。
+   - 施設マスター照合では、部分一致での自動選択を行わず（候補をセルメモに提示し、第一報FAX番号欄には `（要確認: 施設マスター未一致）` を表示）、別施設への誤FAX送信を防止する設計です。
+
+---
+
 ## 📁 ディレクトリ構成
 
 ```text

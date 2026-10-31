@@ -59,7 +59,11 @@ function generateFirstReportDoc(recordData, facilityMasterList) {
   // 施設マスターから正式名称・FAX番号を補完
   const resolvedFacility = resolveFacility(recordData.facilityName, facilityMasterList);
   const facilityName = resolvedFacility.officialName || recordData.facilityName || '';
-  const faxNumber = recordData.faxNumber || resolvedFacility.faxNumber || '';
+  const isFacilityConfirmed =
+    resolvedFacility.matchType === 'exact' || resolvedFacility.matchType === 'core';
+  const faxNumber = isFacilityConfirmed
+    ? recordData.faxNumber || resolvedFacility.faxNumber || ''
+    : '';
 
   const reportDate = formatDateYMD(new Date());
   const visitDate = formatDateYMD(recordData.visitDate) || reportDate;
@@ -73,10 +77,16 @@ function generateFirstReportDoc(recordData, facilityMasterList) {
   try {
     templateFile = DriveApp.getFileById(templateDocId);
   } catch (err) {
-    notifySlackError('第一報テンプレート取得失敗', err, {
-      templateDocId: templateDocId,
-      patientName: patientName,
-    });
+    notifySlackError(
+      '第一報テンプレート取得失敗',
+      err,
+      {
+        templateDocId: templateDocId,
+        patientId: recordData.patientId || '',
+        column: recordData.colNumber || '',
+      },
+      { includeStack: false }
+    );
     throw new Error(`第一報テンプレートファイル(ID: ${templateDocId})の取得に失敗しました: ${err.message}`);
   }
 
@@ -102,7 +112,7 @@ function generateFirstReportDoc(recordData, facilityMasterList) {
     '{{連携先施設名}}': facilityName,
     '{{連携先診療科}}': String(recordData.facilityDept || ''),
     '{{連携先医師名}}': String(recordData.facilityDoctor || ''),
-    '{{連携先FAX番号}}': faxNumber,
+    '{{連携先FAX番号}}': isFacilityConfirmed ? faxNumber : '（要確認: 施設マスター未一致）',
     '{{患者氏名}}': patientName,
     '{{患者ID}}': String(recordData.patientId || ''),
     '{{受診日}}': visitDate,

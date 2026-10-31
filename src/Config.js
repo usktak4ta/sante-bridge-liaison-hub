@@ -374,7 +374,9 @@ function formatDateTimeNow() {
 function sendSlackNotification(title, message, level, extraFields) {
   const { slackWebhookUrl } = getSecretConfig();
   if (!slackWebhookUrl) {
-    Logger.log(`[Slack通知スキップ(URL未設定)] [${level || 'INFO'}] ${title}: ${message}`);
+    Logger.log(
+      `[Slack通知スキップ(URL未設定)] [${level || 'INFO'}] ${title} (length: ${String(message || '').length})`
+    );
     return false;
   }
 
@@ -433,9 +435,16 @@ function sendSlackNotification(title, message, level, extraFields) {
  * @param {string} context エラー発生箇所（例: "kintone POST通信"）
  * @param {Error|string} error エラーオブジェクトまたはメッセージ
  * @param {Object=} metadata 付随メタデータ
+ * @param {{includeStack?: boolean}=} options オプション設定
  */
-function notifySlackError(context, error, metadata) {
-  const errorMsg = error instanceof Error ? `${error.message}\n\`\`\`${error.stack || ''}\`\`\`` : String(error);
+function notifySlackError(context, error, metadata, options) {
+  const includeStack = !options || options.includeStack !== false;
+  const errorMsg =
+    error instanceof Error
+      ? includeStack
+        ? `${error.message}\n\`\`\`${error.stack || ''}\`\`\``
+        : String(error.message || '')
+      : String(error);
   sendSlackNotification(
     `致命的エラー発生: ${context}`,
     errorMsg,

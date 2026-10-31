@@ -375,6 +375,7 @@ function expandJsonAndMatchLedger(rawJsonText, ss) {
   const rowCount = SANTE_CONFIG.INPUT_LAYOUT.ROW_END - SANTE_CONFIG.INPUT_LAYOUT.ROW_START + 1; // 15
   const columnMatrix = Array.from({ length: rowCount }, () => new Array(numCols).fill(''));
   const targetNotes = new Array(numCols).fill('');
+  const facilityNotes = new Array(numCols).fill('');
 
   let matchedCount = 0;
 
@@ -383,7 +384,14 @@ function expandJsonAndMatchLedger(rawJsonText, ss) {
 
     // 施設マスターによる名寄せ（正式名称・更新用キー・FAX番号の取得）
     const resolvedFacility = resolveFacility(rec.facilityName, facilityMasterList);
-    const officialFacilityName = resolvedFacility.officialName || rec.facilityName;
+    const officialFacilityName =
+      resolvedFacility.matchType === 'partial'
+        ? rec.facilityName
+        : resolvedFacility.officialName || rec.facilityName;
+    if (resolvedFacility.matchType === 'partial') {
+      const candidateNames = resolvedFacility.candidates.map((c) => c.officialName).join('／');
+      facilityNotes[colIdx] = `施設名が部分一致のみ: 候補 ${candidateNames}。マスター別名に登録するか正式名称を入力してください`;
+    }
 
     // 15行目: 前方 かつ 入院 の場合は初期値 TRUE、外来等は FALSE（手動チェック可）
     const defaultNeedReport =
@@ -455,6 +463,11 @@ function expandJsonAndMatchLedger(rawJsonText, ss) {
   inputSheet
     .getRange(SANTE_CONFIG.INPUT_LAYOUT.ROW_START, startCol, rowCount, numCols)
     .setValues(columnMatrix);
+
+  // 10行目に部分一致候補の補足メモを付与（一致時は空文字でクリア）
+  inputSheet
+    .getRange(SANTE_CONFIG.INPUT_LAYOUT.ROWS.FACILITY_NAME, startCol, 1, numCols)
+    .setNotes([facilityNotes]);
 
   // 18行目に照合結果の補足メモを付与
   inputSheet
@@ -630,12 +643,26 @@ function executeBatchProcess() {
       const nowStr = formatDateTimeNow();
       const postRecordsPayload = postCandidateCols.map((colData) => {
         const resolved = resolveFacility(colData.facilityName, facilityMasterList);
-        const officialFacilityName = resolved.officialName || colData.facilityName;
+        const officialFacilityName =
+          resolved.matchType === 'partial'
+            ? colData.facilityName
+            : resolved.officialName || colData.facilityName;
 
         // 施設マスター名寄せ結果で入力シート10行目も最新化
-        if (officialFacilityName !== colData.facilityName) {
-          inputSheet.getRange(rows.FACILITY_NAME, colData.colNumber).setValue(officialFacilityName);
-          colData.facilityName = officialFacilityName;
+        const facilityCell = inputSheet.getRange(rows.FACILITY_NAME, colData.colNumber);
+        if (resolved.matchType === 'partial') {
+          const candidateNames = resolved.candidates.map((c) => c.officialName).join('／');
+          facilityCell.setNote(
+            `施設名が部分一致のみ: 候補 ${candidateNames}。マスター別名に登録するか正式名称を入力してください`
+          );
+        } else {
+          if (resolved.matchType === 'exact' || resolved.matchType === 'core') {
+            facilityCell.clearNote();
+          }
+          if (officialFacilityName !== colData.facilityName) {
+            facilityCell.setValue(officialFacilityName);
+            colData.facilityName = officialFacilityName;
+          }
         }
 
         const isForward = colData.phase === SANTE_CONFIG.PHASES.FORWARD;
@@ -828,9 +855,20 @@ function reRunFiveLockMatchingForAllColumns() {
 
   columns.forEach((colData) => {
     const resolved = resolveFacility(colData.facilityName, facilityMasterList);
-    if (resolved.officialName && resolved.officialName !== colData.facilityName) {
-      inputSheet.getRange(rows.FACILITY_NAME, colData.colNumber).setValue(resolved.officialName);
-      colData.facilityName = resolved.officialName;
+    const facilityCell = inputSheet.getRange(rows.FACILITY_NAME, colData.colNumber);
+    if (resolved.matchType === 'partial') {
+      const candidateNames = resolved.candidates.map((c) => c.officialName).join('／');
+      facilityCell.setNote(
+        `施設名が部分一致のみ: 候補 ${candidateNames}。マスター別名に登録するか正式名称を入力してください`
+      );
+    } else {
+      if (resolved.matchType === 'exact' || resolved.matchType === 'core') {
+        facilityCell.clearNote();
+      }
+      if (resolved.officialName && resolved.officialName !== colData.facilityName) {
+        facilityCell.setValue(resolved.officialName);
+        colData.facilityName = resolved.officialName;
+      }
     }
 
     const isReplyOrBackward =
