@@ -88,6 +88,60 @@ function normalizeReferralDeptOption(rawDept) {
 }
 
 /**
+ * 当院担当診療科および担当医師名を正規化する（現役医師11名・9診療科対応）
+ * 退職医（野田明生・佐藤恭一）や選択肢外の医師・診療科はドロップダウン値から除外し、
+ * 備考欄への退避テキスト（extraNote）として返すことで GAIA_FO01 エラーを防止する
+ *
+ * @param {string} rawDept
+ * @param {string} rawDoc
+ * @param {string=} inquiryCol
+ * @param {string=} remarksCol
+ * @return {{dept: string, doctor: string, extraNote: string}}
+ */
+function normalizeOurDeptAndDoctor(rawDept, rawDoc, inquiryCol, remarksCol) {
+  let doc = String(rawDoc || '').replace(/[\s\u3000]+/g, '').replace(/(先生|医師|Dr\.?)$/i, '');
+  let dept = String(rawDept || '').trim();
+  let extraNote = '';
+  // よくある誤字補正
+  if (doc === '大江陽介' || doc === '大江健一') doc = '大江健介';
+  if (doc === '田中準') doc = '田中淳';
+  if (doc === '佐々木威浩' || (!doc && String(inquiryCol || '').includes('佐々木'))) doc = '佐々木威治';
+  // 医師名から診療科の確定または補完（現役11名）
+  if (['溝上泰一朗', '尤郁偉', '劉軒'].includes(doc)) dept = '脳神経外科';
+  else if (['上床武史'].includes(doc)) dept = '脳血管内科';
+  else if (['田中淳'].includes(doc)) dept = '脳神経内科';
+  else if (['奈田慎一'].includes(doc)) dept = '血管外科';
+  else if (['吉原智仁', '泉政寛', '佐々木威治'].includes(doc)) dept = '整形外科';
+  else if (['大江健介'].includes(doc)) dept = dept.includes('循環器') ? '循環器内科' : '内科（一般）';
+  else if (['村山賢一郎'].includes(doc)) dept = dept.includes('消化器') ? '消化器内科' : '内科（一般）';
+  // 退職医（野田明生・佐藤恭一）は診療科だけ補完し、医師名は後段で備考へ退避
+  else if (doc === '野田明生') dept = '整形外科';
+  else if (doc === '佐藤恭一') dept = dept.includes('循環器') ? '循環器内科' : '内科（一般）';
+  else {
+    if (dept.includes('脳外')) dept = '脳神経外科';
+    else if (dept.includes('脳内')) dept = '脳神経内科';
+    else if (dept.includes('血管内科')) dept = '脳血管内科';
+    else if (dept.includes('血管外科') || dept.includes('血外')) dept = '血管外科';
+    else if (dept.includes('整形') || String(inquiryCol || '').includes('整形')) dept = '整形外科';
+    else if (dept.includes('循環器')) dept = '循環器内科';
+    else if (dept.includes('消化器') || (dept === '外科' && String(remarksCol || '').includes('胃カメラ'))) dept = '消化器内科';
+    else if (dept.includes('リハ')) dept = 'リハビリテーション科';
+    else if (dept.includes('内科') || dept === '外科') dept = '内科（一般）';
+  }
+  const validDepts = SANTE_CONFIG.KINTONE.OUR_DEPT_OPTIONS;
+  const validDoctors = SANTE_CONFIG.KINTONE.OUR_DOCTOR_OPTIONS;
+  if (dept && !validDepts.includes(dept)) {
+    extraNote += `当院科:${dept} `;
+    dept = '';
+  }
+  if (doc && !validDoctors.includes(doc)) {
+    extraNote += `旧/他担当医:${doc}`;
+    doc = '';
+  }
+  return { dept: dept, doctor: doc, extraNote: extraNote.trim() };
+}
+
+/**
  * 入力シートの1列分のデータから kintone POST 用の record オブジェクトを構築する
  * @param {{
  *   visitDate: string,
@@ -102,6 +156,7 @@ function normalizeReferralDeptOption(rawDept) {
  *   facilityDoctor: string,
  *   ourDept: string,
  *   ourDoctor: string,
+ *   inquiry?: string,
  *   replyStatus: string,
  *   replyDate: string,
  *   firstReportUrl: string,
@@ -128,8 +183,10 @@ function buildKintonePostRecordPayload(item, excludedFieldsSet) {
   setField(fc.PATIENT_NAME, String(item.patientName || ''));
 
   // 連携フェーズ および 既存アプリB互換の「連携方向」の両方にセット（未定義片方はAuto-Recoveryで自動除外）
-  const phaseVal = String(item.phase || '');
-  setField(fc.PHASE, phaseVal);
+  const phaseVal = String(item.phase || '').trim();
+  if (phaseVal) {
+    setField(fc.PHASE, phaseVal);
+  }
   if (
     phaseVal === SANTE_CONFIG.PHASES.FORWARD ||
     phaseVal === SANTE_CONFIG.PHASES.BACKWARD ||
@@ -139,7 +196,10 @@ function buildKintonePostRecordPayload(item, excludedFieldsSet) {
     setField(fc.DIRECTION, phaseVal);
   }
 
-  setField(fc.VISIT_TYPE, String(item.visitType || ''));
+  const visitTypeVal = String(item.visitType || '').trim();
+  if (visitTypeVal) {
+    setField(fc.VISIT_TYPE, visitTypeVal);
+  }
 
   // ルックアップキーが存在する場合は更新用キーのみをセットし、施設名はルックアップの自動コピーに任せる
   // ルックアップキーが空のときだけ自由入力として施設名をセットする
@@ -160,16 +220,43 @@ function buildKintonePostRecordPayload(item, excludedFieldsSet) {
   }
 
   setField(fc.FACILITY_DOCTOR, String(item.facilityDoctor || ''));
-  setField(fc.OUR_DEPT, String(item.ourDept || ''));
-  setField(fc.OUR_DOCTOR, String(item.ourDoctor || ''));
-  setField(fc.REPLY_STATUS, String(item.replyStatus || ''));
+
+  // 当院担当診療科・担当医師の11名正規化（空のドロップダウン値は送信せず、退職医・選択肢外は備考へ退避）
+  const rawRemarks = String(item.remarks || '').trim();
+  const normalizedOur = normalizeOurDeptAndDoctor(
+    item.ourDept,
+    item.ourDoctor,
+    item.inquiry || '',
+    rawRemarks
+  );
+  if (normalizedOur.dept) {
+    setField(fc.OUR_DEPT, normalizedOur.dept);
+  }
+  if (normalizedOur.doctor) {
+    setField(fc.OUR_DOCTOR, normalizedOur.doctor);
+  }
+
+  const replyStatusVal = String(item.replyStatus || '').trim();
+  if (replyStatusVal) {
+    setField(fc.REPLY_STATUS, replyStatusVal);
+  }
 
   if (item.replyDate) {
     setField(fc.REPLY_DATE, formatDateYMD(item.replyDate));
   }
   setField(fc.FIRST_REPORT_URL, String(item.firstReportUrl || ''));
-  setField(fc.FAX_STATUS, String(item.faxStatus || ''));
-  setField(fc.REMARKS, String(item.remarks || ''));
+  const faxStatusVal = String(item.faxStatus || '').trim();
+  if (faxStatusVal) {
+    setField(fc.FAX_STATUS, faxStatusVal);
+  }
+
+  let finalRemarks = rawRemarks;
+  if (normalizedOur.extraNote && !finalRemarks.includes(normalizedOur.extraNote)) {
+    finalRemarks = finalRemarks
+      ? `${finalRemarks} / ${normalizedOur.extraNote}`
+      : normalizedOur.extraNote;
+  }
+  setField(fc.REMARKS, finalRemarks);
 
   return record;
 }

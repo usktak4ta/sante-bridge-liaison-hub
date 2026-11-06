@@ -12,6 +12,7 @@ const SANTE_CONFIG = Object.freeze({
     INPUT: '紹介・逆紹介入力',
     FACILITY_MASTER: '施設マスター',
     LEDGER_SUFFIX: '年度_連携台帳', // 例: 2026年度_連携台帳
+    PAST_MIGRATION: '【kintone一括登録用】紹介・逆紹介',
   },
 
   // タブ①: 紹介・逆紹介入力 シート座標定義
@@ -71,6 +72,7 @@ const SANTE_CONFIG = Object.freeze({
   VISIT_TYPES: {
     OUTPATIENT: '外来',
     INPATIENT: '入院',
+    EXAM: '検査',
   },
 
   // 返書ステータス定数
@@ -195,6 +197,30 @@ const SANTE_CONFIG = Object.freeze({
       '内科',
       '血管外科',
       'リハビリテーション科',
+    ],
+    OUR_DEPT_OPTIONS: [
+      '脳神経外科',
+      '脳神経内科',
+      '脳血管内科',
+      '内科（一般）',
+      '循環器内科',
+      '消化器内科',
+      '血管外科',
+      '整形外科',
+      'リハビリテーション科',
+    ],
+    OUR_DOCTOR_OPTIONS: [
+      '溝上泰一朗',
+      '上床武史',
+      '尤郁偉',
+      '田中淳',
+      '奈田慎一',
+      '村山賢一郎',
+      '大江健介',
+      '吉原智仁',
+      '劉軒',
+      '泉政寛',
+      '佐々木威治',
     ],
     FIELD_CODES: {
       VISIT_DATE: '受診日',
