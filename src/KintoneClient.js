@@ -44,6 +44,50 @@ function getKintoneRequestContext() {
 }
 
 /**
+ * 診療科文字列を kintone アプリBの「紹介先診療科」5択
+ * （脳神経内科外科 / 整形外科 / 内科 / 血管外科 / リハビリテーション科）へ正規化する。
+ * 5択に正規化できない場合は空文字を返し、選択肢不正エラー（GAIA_FO01）を防止する。
+ *
+ * @param {string} rawDept
+ * @return {string} 5択のいずれか、または空文字 ''
+ */
+function normalizeReferralDeptOption(rawDept) {
+  const s = normalizeCompactString(rawDept);
+  if (!s) return '';
+
+  const validOptions = SANTE_CONFIG.KINTONE.REFERRAL_DEPT_OPTIONS || [
+    '脳神経内科外科',
+    '整形外科',
+    '内科',
+    '血管外科',
+    'リハビリテーション科',
+  ];
+
+  if (validOptions.includes(s)) {
+    return s;
+  }
+
+  if (
+    s === '脳神経内科' ||
+    s === '脳神経外科' ||
+    s === '脳神経内科・外科' ||
+    s === '脳神経外科・内科' ||
+    s === '脳外' ||
+    s === '脳内'
+  ) {
+    return '脳神経内科外科';
+  }
+  if (s === '整形') {
+    return '整形外科';
+  }
+  if (s === 'リハ科' || s === 'リハビリ科' || s === 'リハビリテーション') {
+    return 'リハビリテーション科';
+  }
+
+  return '';
+}
+
+/**
  * 入力シートの1列分のデータから kintone POST 用の record オブジェクトを構築する
  * @param {{
  *   visitDate: string,
@@ -54,6 +98,7 @@ function getKintoneRequestContext() {
  *   lookupKey: string,
  *   facilityName: string,
  *   facilityDept: string,
+ *   referralDept?: string,
  *   facilityDoctor: string,
  *   ourDept: string,
  *   ourDoctor: string,
@@ -96,17 +141,24 @@ function buildKintonePostRecordPayload(item, excludedFieldsSet) {
 
   setField(fc.VISIT_TYPE, String(item.visitType || ''));
 
-  // ルックアップキーが存在する場合は更新用キーをセット、あわせて施設名もセット
-  if (item.lookupKey) {
-    setField(fc.LOOKUP_KEY, String(item.lookupKey));
-  }
-  if (item.facilityName && !item.lookupKey) {
-    setField(fc.FACILITY_NAME, String(item.facilityName));
-  } else if (item.facilityName && fc.FACILITY_NAME !== fc.LOOKUP_KEY) {
+  // ルックアップキーが存在する場合は更新用キーのみをセットし、施設名はルックアップの自動コピーに任せる
+  // ルックアップキーが空のときだけ自由入力として施設名をセットする
+  const lookupKeyStr = String(item.lookupKey || '').trim();
+  if (lookupKeyStr) {
+    setField(fc.LOOKUP_KEY, lookupKeyStr);
+  } else if (item.facilityName) {
     setField(fc.FACILITY_NAME, String(item.facilityName));
   }
 
-  setField(fc.FACILITY_DEPT, String(item.facilityDept || ''));
+  const facilityDeptStr = String(item.facilityDept || '');
+  setField(fc.FACILITY_DEPT, facilityDeptStr);
+  const normalizedReferralDept = normalizeReferralDeptOption(
+    item.referralDept !== undefined ? item.referralDept : facilityDeptStr
+  );
+  if (normalizedReferralDept) {
+    setField(fc.REFERRAL_DEPT, normalizedReferralDept);
+  }
+
   setField(fc.FACILITY_DOCTOR, String(item.facilityDoctor || ''));
   setField(fc.OUR_DEPT, String(item.ourDept || ''));
   setField(fc.OUR_DOCTOR, String(item.ourDoctor || ''));
@@ -239,8 +291,13 @@ function sendKintoneRequestWithAutoRecovery(
         muteHttpExceptions: true,
       });
     } catch (networkErr) {
-      notifySlackError(`${errorContextTitle} ネットワーク通信失敗`, networkErr, errorMeta);
-      throw new Error(`${errorContextTitle} 通信中にネットワークエラーが発生しました: ${networkErr.message}`);
+      notifySlackError(
+        `${errorContextTitle} ネットワーク通信失敗`,
+        'kintone API通信中にネットワークエラーが発生しました',
+        errorMeta,
+        { includeStack: false }
+      );
+      throw new Error(`${errorContextTitle} 通信中にネットワークエラーが発生しました`);
     }
 
     const statusCode = response.getResponseCode();
@@ -265,11 +322,44 @@ function sendKintoneRequestWithAutoRecovery(
       continue;
     }
 
-    notifySlackError(`${errorContextTitle} APIエラー (HTTP ${statusCode})`, responseText, {
-      ...errorMeta,
-      excludedFields: Array.from(sharedExcludedFields).join(', ') || 'なし',
-    });
-    throw new Error(`${errorContextTitle} APIエラー (HTTP ${statusCode}): ${responseText}`);
+    let errorCode = 'UNKNOWN';
+    const errorFieldCodes = [];
+    try {
+      const parsedErr = JSON.parse(responseText);
+      if (parsedErr && parsedErr.code) {
+        errorCode = String(parsedErr.code);
+      }
+      if (parsedErr && parsedErr.errors && typeof parsedErr.errors === 'object') {
+        Object.keys(parsedErr.errors).forEach((errKey) => {
+          const keyMatch = errKey.match(/^records?(?:\[\d+\])?\.([^.]+)(?:\.value)?$/);
+          const fieldName = keyMatch ? keyMatch[1].trim() : errKey.trim();
+          if (fieldName && !errorFieldCodes.includes(fieldName)) {
+            errorFieldCodes.push(fieldName);
+          }
+        });
+      }
+    } catch (_) {
+      // レスポンス本文やレコード値はSlackや例外メッセージへ出さない
+    }
+
+    const safeErrorSummary =
+      errorFieldCodes.length > 0
+        ? `HTTP ${statusCode} / code: ${errorCode} / fields: ${errorFieldCodes.join(', ')}`
+        : `HTTP ${statusCode} / code: ${errorCode}`;
+
+    notifySlackError(
+      `${errorContextTitle} APIエラー (HTTP ${statusCode})`,
+      safeErrorSummary,
+      {
+        ...errorMeta,
+        httpStatus: String(statusCode),
+        errorCode: errorCode,
+        errorFields: errorFieldCodes.join(', ') || 'なし',
+        excludedFields: Array.from(sharedExcludedFields).join(', ') || 'なし',
+      },
+      { includeStack: false }
+    );
+    throw new Error(`${errorContextTitle} APIエラー (HTTP ${statusCode}, code: ${errorCode})`);
   }
 
   throw new Error(`${errorContextTitle}: Auto-Recoveryのリトライ上限(${maxRetries}回)を超過しました。`);

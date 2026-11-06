@@ -86,8 +86,12 @@ const SANTE_CONFIG = Object.freeze({
   REPLY_STATUS: {
     UNCREATED: '未作成',
     COMPLETED: '作成・送付完了',
+    NOT_REQUIRED: '返書不要（医師判断）',
     NOT_APPLICABLE: '対象外',
   },
+
+  // 未返書リマインド抽出のカットオフ開始日（'YYYY-MM-DD' 指定時はその日より前の受診日を抽出対象外とする。'' は全期間対象）
+  REPLY_TRACKING_START_DATE: '',
 
   // FAX送信状況定数
   FAX_STATUS: {
@@ -194,6 +198,13 @@ const SANTE_CONFIG = Object.freeze({
     DEFAULT_APP_ID: '195',
     BATCH_LIMIT: 100, // kintone REST API 1リクエストあたりの最大レコード数
     MAX_AUTO_RECOVERY_RETRIES: 8, // フィールド未定義エラー時の自動除外リトライ上限
+    REFERRAL_DEPT_OPTIONS: [
+      '脳神経内科外科',
+      '整形外科',
+      '内科',
+      '血管外科',
+      'リハビリテーション科',
+    ],
     FIELD_CODES: {
       VISIT_DATE: '受診日',
       PATIENT_ID: '患者ID',
@@ -204,6 +215,7 @@ const SANTE_CONFIG = Object.freeze({
       LOOKUP_KEY: '更新用キー',
       FACILITY_NAME: '連携先施設名',
       FACILITY_DEPT: '連携先診療科',
+      REFERRAL_DEPT: '紹介先診療科',
       FACILITY_DOCTOR: '連携先医師名',
       OUR_DEPT: '当院担当診療科',
       OUR_DOCTOR: '担当医師',
@@ -447,7 +459,7 @@ function sendSlackNotification(title, message, level, extraFields) {
  * @param {{includeStack?: boolean}=} options オプション設定
  */
 function notifySlackError(context, error, metadata, options) {
-  const includeStack = !options || options.includeStack !== false;
+  const includeStack = Boolean(options && options.includeStack === true);
   const errorMsg =
     error instanceof Error
       ? includeStack
@@ -714,10 +726,24 @@ function applyLedgerSheetFormatting(sheet) {
   sheet.setFrozenRows(1);
   sheet.setFrozenColumns(5);
 
-  // N列（返書ステータス: 14列目）への条件付き書式設定
+  // N列（返書ステータス: 14列目）へのプルダウン入力規則・条件付き書式設定
   const replyStatusCol = SANTE_CONFIG.LEDGER_COLUMNS.COL_NUM.REPLY_STATUS; // 14 (N列)
   const maxRows = Math.max(sheet.getMaxRows(), 500);
   const statusRange = sheet.getRange(2, replyStatusCol, maxRows - 1, 1);
+
+  const replyStatusValidation = SpreadsheetApp.newDataValidation()
+    .requireValueInList(
+      [
+        SANTE_CONFIG.REPLY_STATUS.UNCREATED,
+        SANTE_CONFIG.REPLY_STATUS.COMPLETED,
+        SANTE_CONFIG.REPLY_STATUS.NOT_REQUIRED,
+        SANTE_CONFIG.REPLY_STATUS.NOT_APPLICABLE,
+      ],
+      true
+    )
+    .setAllowInvalid(true)
+    .build();
+  statusRange.setDataValidation(replyStatusValidation);
 
   const uncreatedRule = SpreadsheetApp.newConditionalFormatRule()
     .whenTextEqualTo(SANTE_CONFIG.REPLY_STATUS.UNCREATED)
@@ -731,6 +757,12 @@ function applyLedgerSheetFormatting(sheet) {
     .setRanges([statusRange])
     .build();
 
+  const notRequiredRule = SpreadsheetApp.newConditionalFormatRule()
+    .whenTextEqualTo(SANTE_CONFIG.REPLY_STATUS.NOT_REQUIRED)
+    .setBackground('#E6E6E6')
+    .setRanges([statusRange])
+    .build();
+
   // 既存の他列ルールは維持しつつ、N列の重複ルールを防いで設定
   const existingRules = sheet.getConditionalFormatRules() || [];
   const filteredRules = existingRules.filter((rule) => {
@@ -738,7 +770,7 @@ function applyLedgerSheetFormatting(sheet) {
     return !ranges.some((r) => r.getColumn() === replyStatusCol);
   });
 
-  filteredRules.push(uncreatedRule, completedRule);
+  filteredRules.push(uncreatedRule, completedRule, notRequiredRule);
   sheet.setConditionalFormatRules(filteredRules);
 }
 
@@ -829,7 +861,7 @@ function isLock1PatientMatched(inputPatientId, inputPatientName, ledgerPatientId
 
 /**
  * 【ロック2: 施設特定】
- * 名寄せ後の連携先施設名が一致（または部分一致）するかを判定する
+ * 名寄せ後の連携先施設名が完全一致（lookupKeyまたはコア名）するかを判定する
  * @param {{lookupKey: string, officialName: string}} inputFacility
  * @param {string} ledgerLookupKey
  * @param {string} ledgerFacilityName
@@ -908,8 +940,8 @@ function isLock3DoctorMatched(inputDoctorStr, ledgerDoctorStr) {
 
 /**
  * 【ロック4: 未返書状態】
- * 台帳側の返書ステータスが「未作成」（または返書日が空欄）であり、
- * かつ連携フェーズが「前方（紹介・受入）」であるかを判定する
+ * 連携フェーズが「前方（紹介・受入）」であり、返書日が空欄かつ
+ * 返書ステータスが完了系（作成・送付完了 / 返書不要（医師判断） / 対象外）ではない（未作成または空欄）かを判定する
  * @param {string} ledgerPhase
  * @param {string} ledgerReplyStatus
  * @param {string|Date} ledgerReplyDate
@@ -923,15 +955,22 @@ function isLock4UnrepliedForward(ledgerPhase, ledgerReplyStatus, ledgerReplyDate
     return false;
   }
 
-  const statusStr = String(ledgerReplyStatus || '').trim();
   const replyDateStr = formatDateYMD(ledgerReplyDate);
-
-  // 既に「作成・送付完了」かつ返書日が入っている場合は対象外
-  if (statusStr === SANTE_CONFIG.REPLY_STATUS.COMPLETED && replyDateStr !== '') {
+  if (replyDateStr !== '') {
     return false;
   }
 
-  return statusStr === SANTE_CONFIG.REPLY_STATUS.UNCREATED || replyDateStr === '';
+  const statusStr = String(ledgerReplyStatus || '').trim();
+  if (
+    statusStr === SANTE_CONFIG.REPLY_STATUS.COMPLETED ||
+    statusStr === SANTE_CONFIG.REPLY_STATUS.NOT_REQUIRED ||
+    statusStr === SANTE_CONFIG.REPLY_STATUS.NOT_APPLICABLE ||
+    statusStr.startsWith(SANTE_CONFIG.REPLY_STATUS.NOT_APPLICABLE)
+  ) {
+    return false;
+  }
+
+  return statusStr === SANTE_CONFIG.REPLY_STATUS.UNCREATED || statusStr === '';
 }
 
 /**
@@ -1526,6 +1565,50 @@ function getKintoneRequestContext() {
 }
 
 /**
+ * 診療科文字列を kintone アプリBの「紹介先診療科」5択
+ * （脳神経内科外科 / 整形外科 / 内科 / 血管外科 / リハビリテーション科）へ正規化する。
+ * 5択に正規化できない場合は空文字を返し、選択肢不正エラー（GAIA_FO01）を防止する。
+ *
+ * @param {string} rawDept
+ * @return {string} 5択のいずれか、または空文字 ''
+ */
+function normalizeReferralDeptOption(rawDept) {
+  const s = normalizeCompactString(rawDept);
+  if (!s) return '';
+
+  const validOptions = SANTE_CONFIG.KINTONE.REFERRAL_DEPT_OPTIONS || [
+    '脳神経内科外科',
+    '整形外科',
+    '内科',
+    '血管外科',
+    'リハビリテーション科',
+  ];
+
+  if (validOptions.includes(s)) {
+    return s;
+  }
+
+  if (
+    s === '脳神経内科' ||
+    s === '脳神経外科' ||
+    s === '脳神経内科・外科' ||
+    s === '脳神経外科・内科' ||
+    s === '脳外' ||
+    s === '脳内'
+  ) {
+    return '脳神経内科外科';
+  }
+  if (s === '整形') {
+    return '整形外科';
+  }
+  if (s === 'リハ科' || s === 'リハビリ科' || s === 'リハビリテーション') {
+    return 'リハビリテーション科';
+  }
+
+  return '';
+}
+
+/**
  * 入力シートの1列分のデータから kintone POST 用の record オブジェクトを構築する
  * @param {{
  *   visitDate: string,
@@ -1536,6 +1619,7 @@ function getKintoneRequestContext() {
  *   lookupKey: string,
  *   facilityName: string,
  *   facilityDept: string,
+ *   referralDept?: string,
  *   facilityDoctor: string,
  *   ourDept: string,
  *   ourDoctor: string,
@@ -1578,17 +1662,24 @@ function buildKintonePostRecordPayload(item, excludedFieldsSet) {
 
   setField(fc.VISIT_TYPE, String(item.visitType || ''));
 
-  // ルックアップキーが存在する場合は更新用キーをセット、あわせて施設名もセット
-  if (item.lookupKey) {
-    setField(fc.LOOKUP_KEY, String(item.lookupKey));
-  }
-  if (item.facilityName && !item.lookupKey) {
-    setField(fc.FACILITY_NAME, String(item.facilityName));
-  } else if (item.facilityName && fc.FACILITY_NAME !== fc.LOOKUP_KEY) {
+  // ルックアップキーが存在する場合は更新用キーのみをセットし、施設名はルックアップの自動コピーに任せる
+  // ルックアップキーが空のときだけ自由入力として施設名をセットする
+  const lookupKeyStr = String(item.lookupKey || '').trim();
+  if (lookupKeyStr) {
+    setField(fc.LOOKUP_KEY, lookupKeyStr);
+  } else if (item.facilityName) {
     setField(fc.FACILITY_NAME, String(item.facilityName));
   }
 
-  setField(fc.FACILITY_DEPT, String(item.facilityDept || ''));
+  const facilityDeptStr = String(item.facilityDept || '');
+  setField(fc.FACILITY_DEPT, facilityDeptStr);
+  const normalizedReferralDept = normalizeReferralDeptOption(
+    item.referralDept !== undefined ? item.referralDept : facilityDeptStr
+  );
+  if (normalizedReferralDept) {
+    setField(fc.REFERRAL_DEPT, normalizedReferralDept);
+  }
+
   setField(fc.FACILITY_DOCTOR, String(item.facilityDoctor || ''));
   setField(fc.OUR_DEPT, String(item.ourDept || ''));
   setField(fc.OUR_DOCTOR, String(item.ourDoctor || ''));
@@ -1721,8 +1812,13 @@ function sendKintoneRequestWithAutoRecovery(
         muteHttpExceptions: true,
       });
     } catch (networkErr) {
-      notifySlackError(`${errorContextTitle} ネットワーク通信失敗`, networkErr, errorMeta);
-      throw new Error(`${errorContextTitle} 通信中にネットワークエラーが発生しました: ${networkErr.message}`);
+      notifySlackError(
+        `${errorContextTitle} ネットワーク通信失敗`,
+        'kintone API通信中にネットワークエラーが発生しました',
+        errorMeta,
+        { includeStack: false }
+      );
+      throw new Error(`${errorContextTitle} 通信中にネットワークエラーが発生しました`);
     }
 
     const statusCode = response.getResponseCode();
@@ -1747,11 +1843,44 @@ function sendKintoneRequestWithAutoRecovery(
       continue;
     }
 
-    notifySlackError(`${errorContextTitle} APIエラー (HTTP ${statusCode})`, responseText, {
-      ...errorMeta,
-      excludedFields: Array.from(sharedExcludedFields).join(', ') || 'なし',
-    });
-    throw new Error(`${errorContextTitle} APIエラー (HTTP ${statusCode}): ${responseText}`);
+    let errorCode = 'UNKNOWN';
+    const errorFieldCodes = [];
+    try {
+      const parsedErr = JSON.parse(responseText);
+      if (parsedErr && parsedErr.code) {
+        errorCode = String(parsedErr.code);
+      }
+      if (parsedErr && parsedErr.errors && typeof parsedErr.errors === 'object') {
+        Object.keys(parsedErr.errors).forEach((errKey) => {
+          const keyMatch = errKey.match(/^records?(?:\[\d+\])?\.([^.]+)(?:\.value)?$/);
+          const fieldName = keyMatch ? keyMatch[1].trim() : errKey.trim();
+          if (fieldName && !errorFieldCodes.includes(fieldName)) {
+            errorFieldCodes.push(fieldName);
+          }
+        });
+      }
+    } catch (_) {
+      // レスポンス本文やレコード値はSlackや例外メッセージへ出さない
+    }
+
+    const safeErrorSummary =
+      errorFieldCodes.length > 0
+        ? `HTTP ${statusCode} / code: ${errorCode} / fields: ${errorFieldCodes.join(', ')}`
+        : `HTTP ${statusCode} / code: ${errorCode}`;
+
+    notifySlackError(
+      `${errorContextTitle} APIエラー (HTTP ${statusCode})`,
+      safeErrorSummary,
+      {
+        ...errorMeta,
+        httpStatus: String(statusCode),
+        errorCode: errorCode,
+        errorFields: errorFieldCodes.join(', ') || 'なし',
+        excludedFields: Array.from(sharedExcludedFields).join(', ') || 'なし',
+      },
+      { includeStack: false }
+    );
+    throw new Error(`${errorContextTitle} APIエラー (HTTP ${statusCode}, code: ${errorCode})`);
   }
 
   throw new Error(`${errorContextTitle}: Auto-Recoveryのリトライ上限(${maxRetries}回)を超過しました。`);
@@ -1989,12 +2118,14 @@ function cleanDoctorDisplayName(rawDoctor, fallbackText) {
  * 当年度および前年度の連携台帳シートを走査し、未返書の前方紹介レコードをすべて抽出する
  *
  * 抽出条件:
- * - F列 `連携フェーズ` が `"前方"` で始まる
- * - O列 `返書日` が空欄
- * - N列 `返書ステータス` が `"作成・送付完了"`・`"対象外"` ではない
+ * - ロック4（`isLock4UnrepliedForward`）を満たす（F列が前方紹介、O列返書日が空欄、
+ *   N列返書ステータスが完了・返書不要（医師判断）・対象外ではない）
+ * - `SANTE_CONFIG.REPLY_TRACKING_START_DATE` が `YYYY-MM-DD` で設定されている場合、
+ *   その日より前の受診日は抽出対象外とする
  *
  * @param {Date=} baseDate
  * @param {GoogleAppsScript.Spreadsheet.Spreadsheet=} ss
+ * @param {string=} trackingStartDateOverride カットオフ開始日（YYYY-MM-DD）の検証用オーバーライド
  * @return {{
  *   totalCount: number,
  *   over14DaysCount: number,
@@ -2021,10 +2152,15 @@ function cleanDoctorDisplayName(rawDoctor, fallbackText) {
  *   }>
  * }}
  */
-function extractUnrepliedReferrals(baseDate, ss) {
+function extractUnrepliedReferrals(baseDate, ss, trackingStartDateOverride) {
   const nowDate = baseDate || new Date();
   const candidateSheets = getCandidateLedgerSheets(nowDate, ss);
   const idx = SANTE_CONFIG.LEDGER_COLUMNS.INDEX;
+  const rawCutoff =
+    trackingStartDateOverride !== undefined
+      ? trackingStartDateOverride
+      : SANTE_CONFIG.REPLY_TRACKING_START_DATE;
+  const cutoffDate = formatDateYMD(rawCutoff);
 
   const extractedItems = [];
   let over14DaysCount = 0;
@@ -2042,29 +2178,20 @@ function extractUnrepliedReferrals(baseDate, ss) {
     for (let i = 0; i < values.length; i++) {
       const row = values[i];
       const phaseStr = String(row[idx.PHASE] || '').trim();
-      const replyDateStr = formatDateYMD(row[idx.REPLY_DATE]);
       const replyStatusStr = String(row[idx.REPLY_STATUS] || '').trim();
 
-      // 条件1: F列 連携フェーズが "前方" で始まる
-      if (!phaseStr.startsWith('前方')) {
-        continue;
-      }
-
-      // 条件2: O列 返書日が空欄
-      if (replyDateStr !== '') {
-        continue;
-      }
-
-      // 条件3: N列 返書ステータスが "作成・送付完了"・"対象外" ではない
-      if (
-        replyStatusStr === SANTE_CONFIG.REPLY_STATUS.COMPLETED ||
-        replyStatusStr.startsWith(SANTE_CONFIG.REPLY_STATUS.NOT_APPLICABLE)
-      ) {
+      // ロック4と共通判定（前方紹介 かつ 返書日空欄 かつ 作成・送付完了／返書不要（医師判断）／対象外ではない）
+      if (!isLock4UnrepliedForward(phaseStr, replyStatusStr, row[idx.REPLY_DATE])) {
         continue;
       }
 
       const visitDate = formatDateYMD(row[idx.VISIT_DATE]);
       if (!visitDate) continue;
+
+      // カットオフ開始日（REPLY_TRACKING_START_DATE）より前の受診日は抽出対象外
+      if (cutoffDate && visitDate < cutoffDate) {
+        continue;
+      }
 
       const elapsedDays = calculateElapsedDays(visitDate, nowDate);
       const badge = getElapsedBadge(elapsedDays);
@@ -2346,7 +2473,8 @@ function sendLineWorksBotMessage(plainTextMessage) {
       {
         httpStatus: String(status),
         errorCode: errorCode,
-      }
+      },
+      { includeStack: false }
     );
     throw new Error(`LINE WORKS Bot送信エラー (HTTP ${status}, code: ${errorCode})`);
   }
@@ -2409,7 +2537,12 @@ function runScheduledUnrepliedReminder() {
   try {
     executeUnrepliedReminderNotification();
   } catch (err) {
-    notifySlackError('未返書定期リマインド実行エラー', err);
+    notifySlackError(
+      '未返書定期リマインド実行エラー',
+      err,
+      { handler: REMINDER_TRIGGER_HANDLER },
+      { includeStack: false }
+    );
     throw err;
   }
 }
@@ -2543,8 +2676,16 @@ function onEdit(e) {
     expandJsonAndMatchLedger(rawInput, sheet.getParent());
     pasteRange.clearContent();
   } catch (err) {
-    Logger.log(`JSON展開エラー: ${err.message}\n${err.stack || ''}`);
-    notifySlackError('C2セル JSON貼付・横展開エラー', err);
+    Logger.log(`JSON展開エラー: ${err.message}`);
+    notifySlackError(
+      'C2セル JSON貼付・横展開エラー',
+      err,
+      {
+        sheetName: SANTE_CONFIG.SHEETS.INPUT,
+        pasteRange: SANTE_CONFIG.INPUT_LAYOUT.PASTE_RANGE,
+      },
+      { includeStack: false }
+    );
     SpreadsheetApp.getActiveSpreadsheet().toast(
       `JSON解析エラー: ${err.message}`,
       '🚨 SANTE-BRIDGE エラー',
@@ -3289,7 +3430,18 @@ function executeBatchProcess() {
       ledgerUpdated,
     };
   } catch (err) {
-    notifySlackError('一括処理 (executeBatchProcess) 異常終了', err);
+    notifySlackError(
+      '一括処理 (executeBatchProcess) 異常終了',
+      err,
+      {
+        totalColumns: String(columns.length),
+        docsGenerated: String(docsGenerated),
+        kintonePosted: String(kintonePosted),
+        kintonePutUpdated: String(kintonePutUpdated),
+        ledgerUpdated: String(ledgerUpdated),
+      },
+      { includeStack: false }
+    );
     ss.toast(`エラーが発生しました: ${err.message}`, '🚨 処理中断', 10);
     throw err;
   } finally {

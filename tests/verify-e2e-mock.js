@@ -133,7 +133,8 @@ class MockRange {
   setNumberFormat() {
     return this;
   }
-  setDataValidation() {
+  setDataValidation(rule) {
+    this.sheet._lastDataValidation = rule;
     return this;
   }
   insertCheckboxes() {
@@ -268,6 +269,8 @@ const state = {
   failTemplateFetch: false,
   lwMessageHttpStatus: 200,
   lwMessageResponseBody: '{"status":"ok"}',
+  kintoneHttpStatus: 200,
+  kintoneResponseBody: null,
   activeSpreadsheet: new MockSpreadsheet(),
 };
 
@@ -387,6 +390,12 @@ const sandbox = {
       }
       // kintone REST API
       if (url.includes('/k/v1/records.json')) {
+        if (state.kintoneHttpStatus && state.kintoneHttpStatus !== 200) {
+          return {
+            getResponseCode: () => state.kintoneHttpStatus,
+            getContentText: () => state.kintoneResponseBody || '{"code":"GAIA_SV01","message":"error"}',
+          };
+        }
         const count =
           parsedPayload && Array.isArray(parsedPayload.records) ? parsedPayload.records.length : 1;
         return {
@@ -406,22 +415,46 @@ const sandbox = {
   },
   SpreadsheetApp: {
     BorderStyle: { SOLID: 'SOLID', SOLID_MEDIUM: 'SOLID_MEDIUM' },
-    newDataValidation: () => ({
-      requireValueInList: () => ({
-        setAllowInvalid: () => ({
-          build: () => ({}),
-        }),
-      }),
-    }),
-    newConditionalFormatRule: () => ({
-      whenTextEqualTo: () => ({
-        setBackground: () => ({
-          setRanges: () => ({
-            build: () => ({}),
-          }),
-        }),
-      }),
-    }),
+    newDataValidation: () => {
+      let listValues = [];
+      return {
+        requireValueInList: (vals) => {
+          listValues = vals;
+          return {
+            setAllowInvalid: () => ({
+              build: () => ({ listValues }),
+            }),
+          };
+        },
+      };
+    },
+    newConditionalFormatRule: () => {
+      let textVal = '';
+      let bgVal = '';
+      let ruleRanges = [];
+      return {
+        whenTextEqualTo: (t) => {
+          textVal = t;
+          return {
+            setBackground: (bg) => {
+              bgVal = bg;
+              return {
+                setRanges: (r) => {
+                  ruleRanges = r;
+                  return {
+                    build: () => ({
+                      textVal,
+                      bgVal,
+                      getRanges: () => ruleRanges,
+                    }),
+                  };
+                },
+              };
+            },
+          };
+        },
+      };
+    },
     getActiveSpreadsheet: () => state.activeSpreadsheet,
   },
 };
@@ -860,7 +893,323 @@ function recordPass(category, description) {
 }
 
 // ============================================================================
-// 4. コンプライアンス静的検証（Google AI Studio エンドポイント・APIキー不使用確認）
+// 4. 返書ステータス拡張・ロック4・リマインドカットオフ・kintone送信・Slack High回帰検証
+// ============================================================================
+{
+  // 4-1. ロック4 (isLock4UnrepliedForward) の論理修正検証
+  const santeConfig = vm.runInContext('SANTE_CONFIG', sandbox);
+  const forwardPhase = santeConfig.PHASES.FORWARD;
+  assert.strictEqual(
+    sandbox.isLock4UnrepliedForward(forwardPhase, '返書不要（医師判断）', ''),
+    false,
+    '返書日空 + ステータス「返書不要（医師判断）」→ 未返書でない(false)'
+  );
+  assert.strictEqual(
+    sandbox.isLock4UnrepliedForward(forwardPhase, '作成・送付完了', ''),
+    false,
+    '返書日空 + ステータス「作成・送付完了」→ 未返書でない(false)'
+  );
+  assert.strictEqual(
+    sandbox.isLock4UnrepliedForward(forwardPhase, '対象外', ''),
+    false,
+    '返書日空 + ステータス「対象外」→ 未返書でない(false)'
+  );
+  assert.strictEqual(
+    sandbox.isLock4UnrepliedForward(forwardPhase, '未作成', ''),
+    true,
+    '返書日空 + ステータス「未作成」→ 未返書である(true)'
+  );
+  assert.strictEqual(
+    sandbox.isLock4UnrepliedForward(forwardPhase, '', ''),
+    true,
+    '返書日空 + 空ステータス → 未返書である(true)'
+  );
+  assert.strictEqual(
+    sandbox.isLock4UnrepliedForward(forwardPhase, '未作成', '2026-10-30'),
+    false,
+    '返書日あり + ステータス「未作成」→ 未返書でない(false)'
+  );
+  recordPass(
+    '改修① ロック4',
+    'isLock4UnrepliedForward で返書日空でも「返書不要（医師判断）」「作成・送付完了」「対象外」は false、「未作成」または空のみ true となること'
+  );
+
+  // 4-2. リマインド抽出 (extractUnrepliedReferrals) の共通化とカットオフ除外検証
+  state.activeSpreadsheet = new MockSpreadsheet();
+  sandbox.setupAllSheets();
+  const ledgerSheetName = sandbox.getLedgerSheetName();
+  const ledgerSheet = state.activeSpreadsheet.getSheetByName(ledgerSheetName);
+  ledgerSheet.getRange(2, 1, 4, 18).setValues([
+    [
+      '201',
+      '2026-10-01 09:00:00',
+      '2026-10-01', // カットオフ(2026-10-15)より前
+      'P00001',
+      '山田太郎',
+      '前方（紹介・受入）',
+      '外来',
+      'TEST-01',
+      '○○中央病院',
+      '内科',
+      '佐藤一郎',
+      '内科',
+      '溝上太郎',
+      '未作成',
+      '',
+      '',
+      '不要',
+      '',
+    ],
+    [
+      '202',
+      '2026-10-20 09:00:00',
+      '2026-10-20', // カットオフ以降だが「返書不要（医師判断）」
+      'P00002',
+      '鈴木花子',
+      '前方（紹介・受入）',
+      '外来',
+      'TEST-01',
+      '○○中央病院',
+      '内科',
+      '佐藤一郎',
+      '内科',
+      '溝上太郎',
+      '返書不要（医師判断）',
+      '',
+      '',
+      '不要',
+      '',
+    ],
+    [
+      '203',
+      '2026-10-21 09:00:00',
+      '2026-10-21', // カットオフ以降だが返書日空の「作成・送付完了」
+      'P00003',
+      '佐藤健太',
+      '前方（紹介・受入）',
+      '外来',
+      'TEST-01',
+      '○○中央病院',
+      '内科',
+      '佐藤一郎',
+      '内科',
+      '溝上太郎',
+      '作成・送付完了',
+      '',
+      '',
+      '不要',
+      '',
+    ],
+    [
+      '204',
+      '2026-10-22 09:00:00',
+      '2026-10-22', // カットオフ以降 かつ「未作成」→ 抽出対象
+      'P00004',
+      '高橋美咲',
+      '前方（紹介・受入）',
+      '外来',
+      'TEST-01',
+      '○○中央病院',
+      '内科',
+      '佐藤一郎',
+      '内科',
+      '溝上太郎',
+      '未作成',
+      '',
+      '',
+      '不要',
+      '',
+    ],
+  ]);
+
+  // 全期間（デフォルト REPLY_TRACKING_START_DATE = ''）: 201と204の2件のみ抽出され、202(返書不要)と203(作成・送付完了)は除外
+  const fullPeriodReport = sandbox.extractUnrepliedReferrals(
+    new Date('2026-10-31T09:00:00+09:00'),
+    state.activeSpreadsheet
+  );
+  assert.strictEqual(
+    fullPeriodReport.totalCount,
+    2,
+    '全期間抽出で「返書不要（医師判断）」と「作成・送付完了（返書日空）」が除外され2件になること'
+  );
+
+  // カットオフ指定 ('2026-10-15'): 201(2026-10-01受診)も除外され、204の1件のみになること
+  const cutoffReport = sandbox.extractUnrepliedReferrals(
+    new Date('2026-10-31T09:00:00+09:00'),
+    state.activeSpreadsheet,
+    '2026-10-15'
+  );
+  assert.strictEqual(
+    cutoffReport.totalCount,
+    1,
+    'カットオフ開始日(2026-10-15)指定時、それより前の受診日(2026-10-01)が除外され1件になること'
+  );
+  assert.strictEqual(cutoffReport.groupedByDoctor[0].items[0].kintoneRecordId, '204');
+  recordPass(
+    '改修② リマインド抽出・カットオフ',
+    'extractUnrepliedReferrals で「返書不要（医師判断）」およびカットオフ日前のレコードが確実に除外されること'
+  );
+
+  // 4-3. kintone POST ペイロード整理（ルックアップ時の施設名除外 ＆ 紹介先診療科5択正規化）
+  const payloadWithLookup = sandbox.buildKintonePostRecordPayload({
+    visitDate: '2026-10-31',
+    patientId: 'P00100',
+    patientName: '山田太郎',
+    phase: '前方（紹介・受入）',
+    visitType: '外来',
+    lookupKey: 'TEST-01',
+    facilityName: '○○中央病院',
+    facilityDept: '整形外科',
+    facilityDoctor: '佐藤一郎',
+    ourDept: '整形外科',
+    ourDoctor: '溝上太郎',
+    replyStatus: '未作成',
+  });
+  assert.strictEqual(payloadWithLookup['更新用キー'].value, 'TEST-01');
+  assert.strictEqual(
+    payloadWithLookup['連携先施設名'],
+    undefined,
+    'lookupKey があるときは連携先施設名をペイロードに含めないこと'
+  );
+  assert.strictEqual(
+    payloadWithLookup['紹介先診療科'].value,
+    '整形外科',
+    '5択に合致する診療科は紹介先診療科フィールドにセットされること'
+  );
+
+  const payloadWithoutLookup = sandbox.buildKintonePostRecordPayload({
+    visitDate: '2026-10-31',
+    patientId: 'P00101',
+    patientName: '山田太郎',
+    phase: '前方（紹介・受入）',
+    visitType: '外来',
+    lookupKey: '',
+    facilityName: '未登録クリニック',
+    facilityDept: '皮膚科', // 5択外
+    facilityDoctor: '佐藤一郎',
+    ourDept: '内科',
+    ourDoctor: '溝上太郎',
+    replyStatus: '未作成',
+  });
+  assert.strictEqual(
+    payloadWithoutLookup['更新用キー'],
+    undefined,
+    'lookupKey が空のときは更新用キーを含めないこと'
+  );
+  assert.strictEqual(
+    payloadWithoutLookup['連携先施設名'].value,
+    '未登録クリニック',
+    'lookupKey が空のときは自由入力として連携先施設名をセットすること'
+  );
+  assert.strictEqual(
+    payloadWithoutLookup['連携先診療科'].value,
+    '皮膚科',
+    '自由テキストの連携先診療科は常にセットされること'
+  );
+  assert.strictEqual(
+    payloadWithoutLookup['紹介先診療科'],
+    undefined,
+    '5択外の診療科（皮膚科）は紹介先診療科にセットせず GAIA_FO01 を起こさないこと'
+  );
+  recordPass(
+    '改修③ kintone POST整理',
+    'lookupKeyあり時の施設名除外、lookupKey空時の施設名送信、および紹介先診療科5択の安全な正規化セットが機能すること'
+  );
+
+  // 4-4. 台帳N列のステータス定数・入力規則・条件付き書式検証
+  assert.strictEqual(
+    santeConfig.REPLY_STATUS.NOT_REQUIRED,
+    '返書不要（医師判断）',
+    'SANTE_CONFIG.REPLY_STATUS.NOT_REQUIRED が定義されていること'
+  );
+  const rules = ledgerSheet.getConditionalFormatRules();
+  const bgByText = {};
+  rules.forEach((r) => {
+    bgByText[r.textVal] = r.bgVal;
+  });
+  assert.strictEqual(bgByText['未作成'], '#F4CCCC');
+  assert.strictEqual(bgByText['作成・送付完了'], '#D9EAD3');
+  assert.strictEqual(bgByText['返書不要（医師判断）'], '#E6E6E6');
+  assert(
+    ledgerSheet._lastDataValidation &&
+      Array.from(ledgerSheet._lastDataValidation.listValues).includes('返書不要（医師判断）'),
+    '台帳N列の入力規則プルダウンに「返書不要（医師判断）」が含まれること'
+  );
+  recordPass(
+    '改修④ ステータス定数と台帳UI',
+    'REPLY_STATUS.NOT_REQUIRED 定数、台帳N列プルダウン入力規則、および条件付き書式（#E6E6E6）が設定されること'
+  );
+
+  // 4-5. Slack High-1 & High-2: kintone APIエラー時および executeBatchProcess catch 時に本文・PHI・スタックがSlackに出ないこと
+  state.httpRequests.length = 0;
+  state.logs.length = 0;
+  state.kintoneHttpStatus = 400;
+  state.kintoneResponseBody = JSON.stringify({
+    id: 'ERR-999',
+    code: 'GAIA_SV01',
+    message: '山田太郎のレコード登録でエラー詳細メッセージ本文が返却されました',
+    errors: {
+      'records[0].患者氏名.value': {
+        messages: ['山田太郎の氏名フィールドエラー詳細'],
+      },
+    },
+  });
+
+  // 入力シートに未連携データを1列用意して executeBatchProcess を実行（kintone POST失敗 → catch）
+  const inputSheet = state.activeSpreadsheet.getSheetByName('紹介・逆紹介入力');
+  sandbox.expandJsonAndMatchLedger(
+    JSON.stringify([
+      {
+        受診日: '2026-10-31',
+        患者ID: 'P00777',
+        患者氏名: '山田太郎',
+        連携フェーズ: '前方（紹介・受入）',
+        受入形態: '外来',
+        連携先施設名: '○○中央病院',
+        連携先医師名: '佐藤一郎',
+        当院担当診療科: '内科',
+        担当医師: '溝上太郎',
+      },
+    ]),
+    state.activeSpreadsheet
+  );
+
+  let caughtBatchErr = null;
+  try {
+    sandbox.executeBatchProcess();
+  } catch (err) {
+    caughtBatchErr = err;
+  }
+
+  assert(caughtBatchErr !== null, 'kintoneエラー時に例外がスローされること');
+  assert(
+    !caughtBatchErr.message.includes('山田太郎'),
+    'throw された Error.message にレスポンス本文や患者氏名が含まれないこと'
+  );
+  assert(
+    caughtBatchErr.message.includes('HTTP 400') && caughtBatchErr.message.includes('GAIA_SV01'),
+    'throw された Error.message にHTTPステータスとエラーコードが含まれること'
+  );
+
+  const kintoneErrSlackReqs = state.httpRequests.filter((r) => r.url.includes('hooks.slack.com'));
+  assert(kintoneErrSlackReqs.length >= 2, 'KintoneClient と executeBatchProcess catch のSlack通知が送信されること');
+  kintoneErrSlackReqs.forEach((req) => {
+    const bodyStr = JSON.stringify(req.parsedPayload);
+    assert(!bodyStr.includes('山田太郎'), 'Slack通知ペイロードに患者氏名「山田太郎」やレスポンス本文が含まれないこと');
+    assert(!bodyStr.includes('ERR-999'), 'Slack通知ペイロードに生レスポンスJSONが含まれないこと');
+    assert(!bodyStr.includes('at sendKintoneRequestWithAutoRecovery'), 'Slack通知ペイロードにスタックトレースが含まれないこと');
+  });
+
+  state.kintoneHttpStatus = 200;
+  state.kintoneResponseBody = null;
+  recordPass(
+    'Slack High-1 / High-2',
+    'kintone APIエラー時および executeBatchProcess 異常終了時、Slack通知と例外メッセージにレスポンス本文・患者氏名・スタックトレースが一切含まれないこと'
+  );
+}
+
+// ============================================================================
+// 5. コンプライアンス静的検証 ＆ バンドル同期確認
 // ============================================================================
 {
   const filesToScan = [
@@ -871,9 +1220,33 @@ function recordPass(category, description) {
     path.join(ROOT_DIR, 'appsscript.json'),
   ];
 
-  // バンドルファイルの構文チェック
+  // バンドルファイルの構文チェックと src/ との完全一致確認
   const bundleContent = fs.readFileSync(path.join(ROOT_DIR, 'dist', 'SANTE_BRIDGE_BUNDLE.gs'), 'utf8');
   new vm.Script(bundleContent, { filename: 'dist/SANTE_BRIDGE_BUNDLE.gs' });
+
+  const expectedBundleHeader = [
+    '/**',
+    ' * ============================================================================',
+    ' * SANTE-BRIDGE (sante-bridge-liaison-hub) 本番コピペ用 全結合バンドルファイル',
+    ' * 結合順序: Config.js -> LedgerMatcher.js -> DocGenerator.js -> KintoneClient.js -> ReminderService.js -> Code.js',
+    ' * ============================================================================',
+    ' */',
+  ].join('\n');
+  const expectedBundleBody = MODULE_ORDER.map((file) => {
+    const srcText = fs.readFileSync(path.join(SRC_DIR, file), 'utf8').trim();
+    return [
+      '// ============================================================================',
+      `// FILE: src/${file}`,
+      '// ============================================================================',
+      srcText,
+    ].join('\n');
+  }).join('\n\n');
+  const expectedBundle = `${expectedBundleHeader}\n${expectedBundleBody}\n`;
+  assert.strictEqual(
+    bundleContent.trim(),
+    expectedBundle.trim(),
+    'dist/SANTE_BRIDGE_BUNDLE.gs の中身が src/ 各ファイルの結合結果と完全に一致すること'
+  );
 
   filesToScan.forEach((filePath) => {
     const content = fs.readFileSync(filePath, 'utf8');
