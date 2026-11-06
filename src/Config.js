@@ -77,8 +77,12 @@ const SANTE_CONFIG = Object.freeze({
   REPLY_STATUS: {
     UNCREATED: '未作成',
     COMPLETED: '作成・送付完了',
+    NOT_REQUIRED: '返書不要（医師判断）',
     NOT_APPLICABLE: '対象外',
   },
+
+  // 未返書リマインド抽出のカットオフ開始日（'YYYY-MM-DD' 指定時はその日より前の受診日を抽出対象外とする。'' は全期間対象）
+  REPLY_TRACKING_START_DATE: '',
 
   // FAX送信状況定数
   FAX_STATUS: {
@@ -185,6 +189,13 @@ const SANTE_CONFIG = Object.freeze({
     DEFAULT_APP_ID: '195',
     BATCH_LIMIT: 100, // kintone REST API 1リクエストあたりの最大レコード数
     MAX_AUTO_RECOVERY_RETRIES: 8, // フィールド未定義エラー時の自動除外リトライ上限
+    REFERRAL_DEPT_OPTIONS: [
+      '脳神経内科外科',
+      '整形外科',
+      '内科',
+      '血管外科',
+      'リハビリテーション科',
+    ],
     FIELD_CODES: {
       VISIT_DATE: '受診日',
       PATIENT_ID: '患者ID',
@@ -195,6 +206,7 @@ const SANTE_CONFIG = Object.freeze({
       LOOKUP_KEY: '更新用キー',
       FACILITY_NAME: '連携先施設名',
       FACILITY_DEPT: '連携先診療科',
+      REFERRAL_DEPT: '紹介先診療科',
       FACILITY_DOCTOR: '連携先医師名',
       OUR_DEPT: '当院担当診療科',
       OUR_DOCTOR: '担当医師',
@@ -438,7 +450,7 @@ function sendSlackNotification(title, message, level, extraFields) {
  * @param {{includeStack?: boolean}=} options オプション設定
  */
 function notifySlackError(context, error, metadata, options) {
-  const includeStack = !options || options.includeStack !== false;
+  const includeStack = Boolean(options && options.includeStack === true);
   const errorMsg =
     error instanceof Error
       ? includeStack

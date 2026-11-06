@@ -29,15 +29,19 @@ sante-bridge-liaison-hub/
 ├── .gitignore                  # 秘匿情報 (.clasp.json, .env, トークン類) の除外設定
 ├── README.md                   # セットアップ・デプロイ手順書
 ├── appsscript.json             # GASマニフェスト (V8ランタイム, Asia/Tokyo, OAuthスコープ)
+├── dist/
+│   └── SANTE_BRIDGE_BUNDLE.gs  # GASエディタへの1ファイルコピペ反映用・全結合バンドル
 ├── docs/
 │   └── NOTION_SPECIFICATION.md # Notion同期用：プロジェクト仕様書・マッピング表・5重ロック設計書・運用マニュアル
-└── src/
-    ├── Config.js               # 定数・シート定義・PropertiesService秘匿情報管理・Slack通知モジュール
-    ├── Code.js                 # エントリポイント(onOpen, onEdit)・JSON横展開・一括実行・列クリア整理
-    ├── LedgerMatcher.js        # 施設マスター名寄せ・年度別台帳管理(UI固定/条件付き書式)・5重ロック自動照合
-    ├── KintoneClient.js        # kintone REST API (App ID: 195) 複数トークン連結・Auto-Recovery付POST/PUT通信
-    ├── DocGenerator.js         # 第一報（受診・入院報告書）Googleドキュメント複製＆プレースホルダー置換生成
-    └── ReminderService.js      # 未返書リスト抽出・担当医別グルーピング・LINE WORKS Bot / Slack 定期リマインド通知
+├── src/
+│   ├── Config.js               # 定数・シート定義・PropertiesService秘匿情報管理・Slack通知モジュール
+│   ├── Code.js                 # エントリポイント(onOpen, onEdit)・JSON横展開・一括実行・列クリア整理
+│   ├── LedgerMatcher.js        # 施設マスター名寄せ・年度別台帳管理(UI固定/条件付き書式)・5重ロック自動照合
+│   ├── KintoneClient.js        # kintone REST API (App ID: 195) 複数トークン連結・Auto-Recovery付POST/PUT通信
+│   ├── DocGenerator.js         # 第一報（受診・入院報告書）Googleドキュメント複製＆プレースホルダー置換生成
+│   └── ReminderService.js      # 未返書リスト抽出・担当医別グルーピング・LINE WORKS Bot / Slack 定期リマインド通知
+└── tests/
+    └── verify-e2e-mock.js      # 外部API通信なし・全自動E2Eモック検証スクリプト
 ```
 
 ---
@@ -78,4 +82,10 @@ clasp push
 ### 3. スプレッドシート3タブ・テンプレート・定期トリガーの初期構築
 1. **3タブ整備**: メニュー **「⚙️ 初期設定・メンテナンス ＞ 📋 3タブ初期構築・フォーマット整備」** をクリック（スクロール固定およびN列条件付き書式が自動適用されます）。
 2. **第一報テンプレート生成**: メニュー **「⚙️ 初期設定・メンテナンス ＞ 📄 第一報Googleドキュメント標準テンプレート生成」** をクリック。
-3. **未返書リマインド定期トリガー登録**: メニュー **「⚙️ 初期設定・メンテナンス ＞ ⏰ 未返書リマインド定期トリガー設定（毎週月・木 9:00）」** をクリック。
+3. **未返書リマインド定期トリガー登録**: メニュー **「⚙️ 初期設定・メンテナンス ＞ ⏰ 未返書リマインド定期トリガー設定（毎週月・木 9:00）」** をクリック（※過去データ移行時など、特定日以前の受診分をリマインドから除外したい場合は `src/Config.js` の `SANTE_CONFIG.REPLY_TRACKING_START_DATE` に `'YYYY-MM-DD'` を設定します。デフォルト `''` は全期間対象です）。
+
+---
+
+## 🧪 ローカル自動テスト（E2Eモック検証）
+
+外部API通信を一切行わず、GAS環境（Spreadsheet / Drive / Document / UrlFetch 等）をNode.js上でモック化して5重ロック照合・リマインド抽出・kintone送信ペイロード・PHI非出力コンプライアンスを一括検証できます。リポジトリルートで `node tests/verify-e2e-mock.js` を実行し、全項目が `[PASS]` となることを確認してください。

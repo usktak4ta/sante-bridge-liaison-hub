@@ -62,8 +62,16 @@ function onEdit(e) {
     expandJsonAndMatchLedger(rawInput, sheet.getParent());
     pasteRange.clearContent();
   } catch (err) {
-    Logger.log(`JSON展開エラー: ${err.message}\n${err.stack || ''}`);
-    notifySlackError('C2セル JSON貼付・横展開エラー', err);
+    Logger.log(`JSON展開エラー: ${err.message}`);
+    notifySlackError(
+      'C2セル JSON貼付・横展開エラー',
+      err,
+      {
+        sheetName: SANTE_CONFIG.SHEETS.INPUT,
+        pasteRange: SANTE_CONFIG.INPUT_LAYOUT.PASTE_RANGE,
+      },
+      { includeStack: false }
+    );
     SpreadsheetApp.getActiveSpreadsheet().toast(
       `JSON解析エラー: ${err.message}`,
       '🚨 SANTE-BRIDGE エラー',
@@ -808,7 +816,18 @@ function executeBatchProcess() {
       ledgerUpdated,
     };
   } catch (err) {
-    notifySlackError('一括処理 (executeBatchProcess) 異常終了', err);
+    notifySlackError(
+      '一括処理 (executeBatchProcess) 異常終了',
+      err,
+      {
+        totalColumns: String(columns.length),
+        docsGenerated: String(docsGenerated),
+        kintonePosted: String(kintonePosted),
+        kintonePutUpdated: String(kintonePutUpdated),
+        ledgerUpdated: String(ledgerUpdated),
+      },
+      { includeStack: false }
+    );
     ss.toast(`エラーが発生しました: ${err.message}`, '🚨 処理中断', 10);
     throw err;
   } finally {

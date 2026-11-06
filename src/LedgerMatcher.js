@@ -237,10 +237,24 @@ function applyLedgerSheetFormatting(sheet) {
   sheet.setFrozenRows(1);
   sheet.setFrozenColumns(5);
 
-  // N列（返書ステータス: 14列目）への条件付き書式設定
+  // N列（返書ステータス: 14列目）へのプルダウン入力規則・条件付き書式設定
   const replyStatusCol = SANTE_CONFIG.LEDGER_COLUMNS.COL_NUM.REPLY_STATUS; // 14 (N列)
   const maxRows = Math.max(sheet.getMaxRows(), 500);
   const statusRange = sheet.getRange(2, replyStatusCol, maxRows - 1, 1);
+
+  const replyStatusValidation = SpreadsheetApp.newDataValidation()
+    .requireValueInList(
+      [
+        SANTE_CONFIG.REPLY_STATUS.UNCREATED,
+        SANTE_CONFIG.REPLY_STATUS.COMPLETED,
+        SANTE_CONFIG.REPLY_STATUS.NOT_REQUIRED,
+        SANTE_CONFIG.REPLY_STATUS.NOT_APPLICABLE,
+      ],
+      true
+    )
+    .setAllowInvalid(true)
+    .build();
+  statusRange.setDataValidation(replyStatusValidation);
 
   const uncreatedRule = SpreadsheetApp.newConditionalFormatRule()
     .whenTextEqualTo(SANTE_CONFIG.REPLY_STATUS.UNCREATED)
@@ -254,6 +268,12 @@ function applyLedgerSheetFormatting(sheet) {
     .setRanges([statusRange])
     .build();
 
+  const notRequiredRule = SpreadsheetApp.newConditionalFormatRule()
+    .whenTextEqualTo(SANTE_CONFIG.REPLY_STATUS.NOT_REQUIRED)
+    .setBackground('#E6E6E6')
+    .setRanges([statusRange])
+    .build();
+
   // 既存の他列ルールは維持しつつ、N列の重複ルールを防いで設定
   const existingRules = sheet.getConditionalFormatRules() || [];
   const filteredRules = existingRules.filter((rule) => {
@@ -261,7 +281,7 @@ function applyLedgerSheetFormatting(sheet) {
     return !ranges.some((r) => r.getColumn() === replyStatusCol);
   });
 
-  filteredRules.push(uncreatedRule, completedRule);
+  filteredRules.push(uncreatedRule, completedRule, notRequiredRule);
   sheet.setConditionalFormatRules(filteredRules);
 }
 
@@ -352,7 +372,7 @@ function isLock1PatientMatched(inputPatientId, inputPatientName, ledgerPatientId
 
 /**
  * 【ロック2: 施設特定】
- * 名寄せ後の連携先施設名が一致（または部分一致）するかを判定する
+ * 名寄せ後の連携先施設名が完全一致（lookupKeyまたはコア名）するかを判定する
  * @param {{lookupKey: string, officialName: string}} inputFacility
  * @param {string} ledgerLookupKey
  * @param {string} ledgerFacilityName
@@ -431,8 +451,8 @@ function isLock3DoctorMatched(inputDoctorStr, ledgerDoctorStr) {
 
 /**
  * 【ロック4: 未返書状態】
- * 台帳側の返書ステータスが「未作成」（または返書日が空欄）であり、
- * かつ連携フェーズが「前方（紹介・受入）」であるかを判定する
+ * 連携フェーズが「前方（紹介・受入）」であり、返書日が空欄かつ
+ * 返書ステータスが完了系（作成・送付完了 / 返書不要（医師判断） / 対象外）ではない（未作成または空欄）かを判定する
  * @param {string} ledgerPhase
  * @param {string} ledgerReplyStatus
  * @param {string|Date} ledgerReplyDate
@@ -446,15 +466,22 @@ function isLock4UnrepliedForward(ledgerPhase, ledgerReplyStatus, ledgerReplyDate
     return false;
   }
 
-  const statusStr = String(ledgerReplyStatus || '').trim();
   const replyDateStr = formatDateYMD(ledgerReplyDate);
-
-  // 既に「作成・送付完了」かつ返書日が入っている場合は対象外
-  if (statusStr === SANTE_CONFIG.REPLY_STATUS.COMPLETED && replyDateStr !== '') {
+  if (replyDateStr !== '') {
     return false;
   }
 
-  return statusStr === SANTE_CONFIG.REPLY_STATUS.UNCREATED || replyDateStr === '';
+  const statusStr = String(ledgerReplyStatus || '').trim();
+  if (
+    statusStr === SANTE_CONFIG.REPLY_STATUS.COMPLETED ||
+    statusStr === SANTE_CONFIG.REPLY_STATUS.NOT_REQUIRED ||
+    statusStr === SANTE_CONFIG.REPLY_STATUS.NOT_APPLICABLE ||
+    statusStr.startsWith(SANTE_CONFIG.REPLY_STATUS.NOT_APPLICABLE)
+  ) {
+    return false;
+  }
+
+  return statusStr === SANTE_CONFIG.REPLY_STATUS.UNCREATED || statusStr === '';
 }
 
 /**

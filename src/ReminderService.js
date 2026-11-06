@@ -97,12 +97,14 @@ function cleanDoctorDisplayName(rawDoctor, fallbackText) {
  * 当年度および前年度の連携台帳シートを走査し、未返書の前方紹介レコードをすべて抽出する
  *
  * 抽出条件:
- * - F列 `連携フェーズ` が `"前方"` で始まる
- * - O列 `返書日` が空欄
- * - N列 `返書ステータス` が `"作成・送付完了"`・`"対象外"` ではない
+ * - ロック4（`isLock4UnrepliedForward`）を満たす（F列が前方紹介、O列返書日が空欄、
+ *   N列返書ステータスが完了・返書不要（医師判断）・対象外ではない）
+ * - `SANTE_CONFIG.REPLY_TRACKING_START_DATE` が `YYYY-MM-DD` で設定されている場合、
+ *   その日より前の受診日は抽出対象外とする
  *
  * @param {Date=} baseDate
  * @param {GoogleAppsScript.Spreadsheet.Spreadsheet=} ss
+ * @param {string=} trackingStartDateOverride カットオフ開始日（YYYY-MM-DD）の検証用オーバーライド
  * @return {{
  *   totalCount: number,
  *   over14DaysCount: number,
@@ -129,10 +131,15 @@ function cleanDoctorDisplayName(rawDoctor, fallbackText) {
  *   }>
  * }}
  */
-function extractUnrepliedReferrals(baseDate, ss) {
+function extractUnrepliedReferrals(baseDate, ss, trackingStartDateOverride) {
   const nowDate = baseDate || new Date();
   const candidateSheets = getCandidateLedgerSheets(nowDate, ss);
   const idx = SANTE_CONFIG.LEDGER_COLUMNS.INDEX;
+  const rawCutoff =
+    trackingStartDateOverride !== undefined
+      ? trackingStartDateOverride
+      : SANTE_CONFIG.REPLY_TRACKING_START_DATE;
+  const cutoffDate = formatDateYMD(rawCutoff);
 
   const extractedItems = [];
   let over14DaysCount = 0;
@@ -150,29 +157,20 @@ function extractUnrepliedReferrals(baseDate, ss) {
     for (let i = 0; i < values.length; i++) {
       const row = values[i];
       const phaseStr = String(row[idx.PHASE] || '').trim();
-      const replyDateStr = formatDateYMD(row[idx.REPLY_DATE]);
       const replyStatusStr = String(row[idx.REPLY_STATUS] || '').trim();
 
-      // 条件1: F列 連携フェーズが "前方" で始まる
-      if (!phaseStr.startsWith('前方')) {
-        continue;
-      }
-
-      // 条件2: O列 返書日が空欄
-      if (replyDateStr !== '') {
-        continue;
-      }
-
-      // 条件3: N列 返書ステータスが "作成・送付完了"・"対象外" ではない
-      if (
-        replyStatusStr === SANTE_CONFIG.REPLY_STATUS.COMPLETED ||
-        replyStatusStr.startsWith(SANTE_CONFIG.REPLY_STATUS.NOT_APPLICABLE)
-      ) {
+      // ロック4と共通判定（前方紹介 かつ 返書日空欄 かつ 作成・送付完了／返書不要（医師判断）／対象外ではない）
+      if (!isLock4UnrepliedForward(phaseStr, replyStatusStr, row[idx.REPLY_DATE])) {
         continue;
       }
 
       const visitDate = formatDateYMD(row[idx.VISIT_DATE]);
       if (!visitDate) continue;
+
+      // カットオフ開始日（REPLY_TRACKING_START_DATE）より前の受診日は抽出対象外
+      if (cutoffDate && visitDate < cutoffDate) {
+        continue;
+      }
 
       const elapsedDays = calculateElapsedDays(visitDate, nowDate);
       const badge = getElapsedBadge(elapsedDays);
@@ -454,7 +452,8 @@ function sendLineWorksBotMessage(plainTextMessage) {
       {
         httpStatus: String(status),
         errorCode: errorCode,
-      }
+      },
+      { includeStack: false }
     );
     throw new Error(`LINE WORKS Bot送信エラー (HTTP ${status}, code: ${errorCode})`);
   }
@@ -517,7 +516,12 @@ function runScheduledUnrepliedReminder() {
   try {
     executeUnrepliedReminderNotification();
   } catch (err) {
-    notifySlackError('未返書定期リマインド実行エラー', err);
+    notifySlackError(
+      '未返書定期リマインド実行エラー',
+      err,
+      { handler: REMINDER_TRIGGER_HANDLER },
+      { includeStack: false }
+    );
     throw err;
   }
 }
