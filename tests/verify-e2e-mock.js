@@ -226,12 +226,19 @@ class MockSheet {
   setConditionalFormatRules(rules) {
     this.conditionalRules = rules;
   }
+  clear() {
+    this.cells.clear();
+    this._noteEvents.length = 0;
+  }
 }
 
 class MockSpreadsheet {
   constructor() {
     this.sheets = new Map();
     this.toasts = [];
+  }
+  getSheets() {
+    return Array.from(this.sheets.values());
   }
   getSheetByName(name) {
     return this.sheets.get(name) || null;
@@ -317,6 +324,7 @@ const sandbox = {
       if (fmt === 'yyyy-MM-dd HH:mm:ss') return `${yyyy}-${mm}-${dd} 09:00:00`;
       return `${yyyy}-${mm}-${dd}`;
     },
+    base64Encode: () => 'ZHVtbXk=',
     base64EncodeWebSafe: () => 'dummysig',
     computeRsaSha256Signature: () => [1, 2, 3, 4],
     Charset: { UTF_8: 'UTF-8' },
@@ -467,6 +475,7 @@ const MODULE_ORDER = [
   'DocGenerator.js',
   'KintoneClient.js',
   'ReminderService.js',
+  'PastDataMigration.js',
   'Code.js',
 ];
 
@@ -1209,6 +1218,299 @@ function recordPass(category, description) {
 }
 
 // ============================================================================
+// 5. 当院担当医11名化・返書不要初期自動判定・自動クリア・過去データ移行検証
+// ============================================================================
+{
+  const santeConfig = vm.runInContext('SANTE_CONFIG', sandbox);
+
+  // 5-1. タスク1: normalizeOurDeptAndDoctor (現役11名通過、退職医2名・選択肢外の備考退避)
+  const expected11Doctors = [
+    '溝上泰一朗',
+    '上床武史',
+    '尤郁偉',
+    '田中淳',
+    '奈田慎一',
+    '村山賢一郎',
+    '大江健介',
+    '吉原智仁',
+    '劉軒',
+    '泉政寛',
+    '佐々木威治',
+  ];
+  assert.deepStrictEqual(
+    Array.from(santeConfig.KINTONE.OUR_DOCTOR_OPTIONS),
+    expected11Doctors,
+    'OUR_DOCTOR_OPTIONS が現役11名と完全一致し、退職医2名（野田明生・佐藤恭一）を含まないこと'
+  );
+
+  expected11Doctors.forEach((docName) => {
+    const res = sandbox.normalizeOurDeptAndDoctor('', docName, '', '');
+    assert.strictEqual(res.doctor, docName, `現役医師 ${docName} がそのまま doctor に残ること`);
+    assert(
+      santeConfig.KINTONE.OUR_DEPT_OPTIONS.includes(res.dept),
+      `現役医師 ${docName} から有効な診療科 (${res.dept}) が補完されること`
+    );
+    assert.strictEqual(res.extraNote, '', `現役医師 ${docName} の extraNote が空であること`);
+  });
+
+  // 退職医1: 野田明生 → 診療科「整形外科」、医師空、extraNote に「旧/他担当医:野田明生」
+  const nodaRes = sandbox.normalizeOurDeptAndDoctor('', '野田明生', '', '');
+  assert.strictEqual(nodaRes.dept, '整形外科');
+  assert.strictEqual(nodaRes.doctor, '');
+  assert.strictEqual(nodaRes.extraNote, '旧/他担当医:野田明生');
+
+  // 退職医2: 佐藤恭一 → 文脈により「内科（一般）」または「循環器内科」、医師空、extraNote に「旧/他担当医:佐藤恭一」
+  const satoGeneralRes = sandbox.normalizeOurDeptAndDoctor('内科', '佐藤恭一', '', '');
+  assert.strictEqual(satoGeneralRes.dept, '内科（一般）');
+  assert.strictEqual(satoGeneralRes.doctor, '');
+  assert.strictEqual(satoGeneralRes.extraNote, '旧/他担当医:佐藤恭一');
+
+  const satoCardioRes = sandbox.normalizeOurDeptAndDoctor('循環器内科', '佐藤恭一', '', '');
+  assert.strictEqual(satoCardioRes.dept, '循環器内科');
+  assert.strictEqual(satoCardioRes.doctor, '');
+  assert.strictEqual(satoCardioRes.extraNote, '旧/他担当医:佐藤恭一');
+
+  // buildKintonePostRecordPayload で退職医がドロップダウンに送られず備考へ退避されること
+  const retiredPayload = sandbox.buildKintonePostRecordPayload({
+    visitDate: '2026-10-31',
+    patientId: '12345',
+    patientName: '山田太郎',
+    phase: '前方（紹介・受入）',
+    visitType: '外来',
+    lookupKey: 'TEST-01',
+    facilityName: '○○中央病院',
+    facilityDept: '整形外科',
+    facilityDoctor: '佐藤一郎',
+    ourDept: '',
+    ourDoctor: '野田明生',
+    replyStatus: '未作成',
+    remarks: '紹介状持参',
+  });
+  assert.strictEqual(retiredPayload['当院担当診療科'].value, '整形外科');
+  assert.strictEqual(
+    retiredPayload['担当医師'],
+    undefined,
+    '退職医の場合、担当医師フィールドがペイロードから省略されること'
+  );
+  assert(
+    retiredPayload['備考・連絡事項'].value.includes('紹介状持参') &&
+      retiredPayload['備考・連絡事項'].value.includes('旧/他担当医:野田明生'),
+    '既存の備考を消さずに末尾へ旧/他担当医が追記されること'
+  );
+  recordPass(
+    'タスク1 医師11名化・備考退避',
+    'normalizeOurDeptAndDoctor で現役11名が通過し、野田明生・佐藤恭一等の退職医は診療科のみ補完して医師フィールド省略＋備考退避されること'
+  );
+
+  // 5-2. タスク2: 前方紹介時の「返書不要（医師判断）」初期自動判定
+  assert.strictEqual(
+    sandbox.decideInitialReplyStatus('前方（紹介・受入）', 'ご本人希望により返書不要'),
+    '返書不要（医師判断）'
+  );
+  assert.strictEqual(
+    sandbox.decideInitialReplyStatus('前方（紹介・受入）', '返書は書かない方針'),
+    '返書不要（医師判断）'
+  );
+  assert.strictEqual(
+    sandbox.decideInitialReplyStatus('前方（紹介・受入）', '特記事項なし'),
+    '未作成'
+  );
+  assert.strictEqual(
+    sandbox.decideInitialReplyStatus('後方（逆紹介・送出）', '返書不要'),
+    '対象外'
+  );
+  recordPass(
+    'タスク2 返書不要初期自動判定',
+    'decideInitialReplyStatus で前方＋備考「返書不要」「書かない」等が NOT_REQUIRED、通常前方が UNCREATED、後方が NOT_APPLICABLE になること'
+  );
+
+  // 5-3. タスク3: 一括実行完了後の入力シート自動クリア
+  state.activeSpreadsheet = new MockSpreadsheet();
+  sandbox.setupAllSheets();
+  const masterSheet = state.activeSpreadsheet.getSheetByName('施設マスター');
+  masterSheet.getRange(2, 1, 2, 7).setValues([
+    ['TEST-01', '○○中央病院', '東京都千代田区1-1', '03-0000-0001', '', '', ''],
+    ['TEST-02', '△△中央病院', '東京都中央区2-2', '03-0000-0002', '', '', ''],
+  ]);
+
+  const inputSheet = state.activeSpreadsheet.getSheetByName('紹介・逆紹介入力');
+  inputSheet.getRange('C2').setValue('[{"dummy":"json"}]');
+  sandbox.expandJsonAndMatchLedger(
+    JSON.stringify([
+      {
+        受診日: '2026-10-31',
+        患者ID: '12345',
+        患者氏名: '山田太郎',
+        連携フェーズ: '前方（紹介・受入）',
+        受入形態: '外来',
+        連携先施設名: '○○中央病院', // 完全一致 → 同期後自動クリア対象
+        連携先医師名: '佐藤一郎',
+        当院担当診療科: '脳神経外科',
+        担当医師: '溝上泰一朗',
+        備考: '返書不要との記載あり',
+      },
+      {
+        受診日: '2026-10-31',
+        患者ID: '67890',
+        患者氏名: '鈴木花子',
+        連携フェーズ: '前方（紹介・受入）',
+        受入形態: '外来',
+        連携先施設名: '中央病院', // 部分一致保留 → 入力シートに残す
+        連携先医師名: '高橋次郎',
+        当院担当診療科: '整形外科',
+        担当医師: '吉原智仁',
+        備考: '',
+      },
+    ]),
+    state.activeSpreadsheet
+  );
+
+  const batchRes = sandbox.executeBatchProcess();
+  assert.strictEqual(batchRes.kintonePosted, 2, '2件ともkintone POSTされること');
+  assert.strictEqual(batchRes.autoClearedCount, 1, '完全一致で同期完了したC列(col 3)の1列のみ自動クリアされること');
+  assert.strictEqual(inputSheet.getRange('C2').getValue(), '', 'C2:C3 貼付セルがクリアされること');
+  assert.strictEqual(inputSheet.getRange(4, 3).getValue(), '', '同期成功したC列(col 3)の4行目ステータスがクリアされること');
+  assert.strictEqual(inputSheet.getRange(7, 3).getValue(), '', '同期成功したC列(col 3)の患者氏名がクリアされること');
+  assert.strictEqual(inputSheet.getRange(5, 3).getNote(), '', '同期成功したC列(col 3)のセルNoteがクリアされること');
+  assert.strictEqual(inputSheet.getRange(15, 3).getValue(), false, '同期成功したC列(col 3)の15行目チェックボックスが false になること');
+  assert.strictEqual(inputSheet.getRange(17, 3).getValue(), false, '同期成功したC列(col 3)の17行目チェックボックスが false になること');
+  assert.strictEqual(
+    inputSheet.getRange(10, 4).getValue(),
+    '中央病院',
+    '部分一致保留のD列(col 4)はクリアされずに残ること'
+  );
+  const lastToast = state.activeSpreadsheet.toasts[state.activeSpreadsheet.toasts.length - 1];
+  assert(
+    lastToast &&
+      lastToast.msg.includes('生成した第一報URLや登録内容は年度別連携台帳タブに記録され、入力シートの完了列をクリアしました'),
+    '完了トーストに台帳記録・入力シート完了列クリアの案内が含まれること'
+  );
+
+  // 台帳側に1件目（返書不要）が NOT_REQUIRED で記録されていることも確認
+  const ledgerSheet = state.activeSpreadsheet.getSheetByName(sandbox.getLedgerSheetName());
+  assert.strictEqual(
+    ledgerSheet.getRange(2, 14).getValue(),
+    '返書不要（医師判断）',
+    '備考に「返書不要」がある前方紹介が台帳N列に「返書不要（医師判断）」で記録されること'
+  );
+  recordPass(
+    'タスク3 一括実行後の自動クリア',
+    'executeBatchProcess 完了後、同期成功列と C2:C3 が自動クリア（チェックボックス false 化・Note消去）され、部分一致保留列は残ること'
+  );
+
+  // 5-4. タスク4: 過去データ移行（4段階ステータス判定・シート合体・BOM付CSV・kintone一括POST＆台帳反映）
+  // (a) 4段階ステータス純粋関数テスト
+  const stBackward = sandbox.classifyPastRecordReplyStatus('', '', '逆紹介送出', '');
+  assert.strictEqual(stBackward.phase, '後方（逆紹介・送出）');
+  assert.strictEqual(stBackward.replyStatus, '対象外');
+
+  const stCompletedByDate = sandbox.classifyPastRecordReplyStatus('2026-05-10', '', '', '');
+  assert.strictEqual(stCompletedByDate.phase, '前方（紹介・受入）');
+  assert.strictEqual(stCompletedByDate.replyStatus, '作成・送付完了');
+
+  const stCompletedByDone = sandbox.classifyPastRecordReplyStatus('', '済', '', '');
+  assert.strictEqual(stCompletedByDone.replyStatus, '作成・送付完了');
+
+  const stNotRequired = sandbox.classifyPastRecordReplyStatus('', '未', '', '患者キャンセルのため不要');
+  assert.strictEqual(stNotRequired.replyStatus, '返書不要（医師判断）');
+
+  const stUncreated = sandbox.classifyPastRecordReplyStatus('', '未', '', '紹介状あり');
+  assert.strictEqual(stUncreated.replyStatus, '未作成');
+
+  // (b) 月別シート合体 (buildPastDataMigrationSheet) -> CSV (buildMigrationCsvContent) -> 一括POST (sendPastDataToKintoneAppB)
+  const pastMonthSheet = state.activeSpreadsheet.insertSheet('2026年4月');
+  const pastRows = [
+    [
+      '来院日',
+      '患者ID',
+      '患者氏名',
+      '紹介元病院名',
+      '紹介元診療科',
+      '紹介元医師名',
+      '受入・送出形態',
+      '当院診療科',
+      '担当医師',
+      '返書日',
+      '済/未',
+      '予備',
+      '問い合わせ',
+      '備考',
+    ],
+    [
+      '2026-04-10',
+      '10001',
+      '山田太郎',
+      '○○中央病院', // マスタ完全一致 -> TEST-01
+      '整形外科',     // 5択一致
+      '佐藤 一郎',
+      '外来',
+      '',
+      '野田明生',     // 退職医 -> 整形外科 + 備考退避
+      '2026-04-15',
+      '済',
+      '',
+      '',
+      '',
+    ],
+    [
+      '2026-04-12',
+      '10002',
+      '鈴木花子',
+      '中央病院',     // 部分一致のみ -> lookupKey 空 + 備考退避
+      '皮膚科',       // 5択外
+      '高橋 次郎',
+      '検査',         // EXAM
+      '循環器内科',
+      '佐藤恭一',     // 退職医 -> 循環器内科 + 備考退避
+      '',
+      '未',
+      '',
+      '',
+      '返書なし',     // -> 返書不要（医師判断）
+    ],
+  ];
+  pastMonthSheet.getRange(1, 1, pastRows.length, 14).setValues(pastRows);
+
+  const migBuildRes = sandbox.buildPastDataMigrationSheet(state.activeSpreadsheet);
+  assert.strictEqual(migBuildRes.totalCount, 2, '月別シートから2件が合体抽出されること');
+  assert.strictEqual(migBuildRes.countsByStatus['作成・送付完了'], 1);
+  assert.strictEqual(migBuildRes.countsByStatus['返書不要（医師判断）'], 1);
+
+  const csvRes = sandbox.downloadMigrationCsv(state.activeSpreadsheet);
+  assert(csvRes.csvContent.startsWith('\uFEFF'), '生成されるCSVがBOM（\\uFEFF）で始まること');
+  assert.strictEqual(csvRes.rowCount, 2);
+
+  state.httpRequests.length = 0;
+  const migPostRes = sandbox.sendPastDataToKintoneAppB(state.activeSpreadsheet);
+  assert.strictEqual(migPostRes.postedCount, 2);
+  assert.strictEqual(migPostRes.ledgerAppendedCount, 2);
+
+  const kintonePostReqs = state.httpRequests.filter((r) => r.url.includes('/k/v1/records.json'));
+  assert.strictEqual(kintonePostReqs.length, 1);
+  const postedRecords = kintonePostReqs[0].parsedPayload.records;
+  assert.strictEqual(
+    postedRecords[0]['連携先施設名_0'],
+    undefined,
+    'ルックアップ自動コピー先の連携先施設名_0がPOSTペイロードに含まれないこと'
+  );
+  assert.strictEqual(
+    postedRecords[0]['連携先施設名'],
+    undefined,
+    '移行POSTペイロードに連携先施設名が含まれないこと'
+  );
+  assert.strictEqual(postedRecords[0]['更新用キー'].value, 'TEST-01');
+  assert.strictEqual(postedRecords[0]['当院担当診療科'].value, '整形外科');
+  assert.strictEqual(postedRecords[0]['担当医師'], undefined, '退職医は担当医師フィールドが省略されること');
+  assert.strictEqual(postedRecords[1]['更新用キー'], undefined, '部分一致のみの施設は更新用キーが省略されること');
+  assert.strictEqual(postedRecords[1]['返書日'], undefined, '空の返書日はPOSTペイロードから省略されること');
+
+  recordPass(
+    'タスク4 過去データ移行機能',
+    '返書ステータス4段階自動判定・全月タブ合体・BOM付UTF-8 CSV出力・kintone一括POST＆年度別台帳同時反映が正常に動作すること'
+  );
+}
+
+// ============================================================================
 // 5. コンプライアンス静的検証 ＆ バンドル同期確認
 // ============================================================================
 {
@@ -1228,7 +1530,7 @@ function recordPass(category, description) {
     '/**',
     ' * ============================================================================',
     ' * SANTE-BRIDGE (sante-bridge-liaison-hub) 本番コピペ用 全結合バンドルファイル',
-    ' * 結合順序: Config.js -> LedgerMatcher.js -> DocGenerator.js -> KintoneClient.js -> ReminderService.js -> Code.js',
+    ' * 結合順序: Config.js -> LedgerMatcher.js -> DocGenerator.js -> KintoneClient.js -> ReminderService.js -> PastDataMigration.js -> Code.js',
     ' * ============================================================================',
     ' */',
   ].join('\n');

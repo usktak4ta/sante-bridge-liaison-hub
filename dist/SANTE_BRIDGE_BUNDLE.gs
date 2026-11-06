@@ -1,7 +1,7 @@
 /**
  * ============================================================================
  * SANTE-BRIDGE (sante-bridge-liaison-hub) 本番コピペ用 全結合バンドルファイル
- * 結合順序: Config.js -> LedgerMatcher.js -> DocGenerator.js -> KintoneClient.js -> ReminderService.js -> Code.js
+ * 結合順序: Config.js -> LedgerMatcher.js -> DocGenerator.js -> KintoneClient.js -> ReminderService.js -> PastDataMigration.js -> Code.js
  * ============================================================================
  */
 // ============================================================================
@@ -21,6 +21,7 @@ const SANTE_CONFIG = Object.freeze({
     INPUT: '紹介・逆紹介入力',
     FACILITY_MASTER: '施設マスター',
     LEDGER_SUFFIX: '年度_連携台帳', // 例: 2026年度_連携台帳
+    PAST_MIGRATION: '【kintone一括登録用】紹介・逆紹介',
   },
 
   // タブ①: 紹介・逆紹介入力 シート座標定義
@@ -80,6 +81,7 @@ const SANTE_CONFIG = Object.freeze({
   VISIT_TYPES: {
     OUTPATIENT: '外来',
     INPATIENT: '入院',
+    EXAM: '検査',
   },
 
   // 返書ステータス定数
@@ -204,6 +206,30 @@ const SANTE_CONFIG = Object.freeze({
       '内科',
       '血管外科',
       'リハビリテーション科',
+    ],
+    OUR_DEPT_OPTIONS: [
+      '脳神経外科',
+      '脳神経内科',
+      '脳血管内科',
+      '内科（一般）',
+      '循環器内科',
+      '消化器内科',
+      '血管外科',
+      '整形外科',
+      'リハビリテーション科',
+    ],
+    OUR_DOCTOR_OPTIONS: [
+      '溝上泰一朗',
+      '上床武史',
+      '尤郁偉',
+      '田中淳',
+      '奈田慎一',
+      '村山賢一郎',
+      '大江健介',
+      '吉原智仁',
+      '劉軒',
+      '泉政寛',
+      '佐々木威治',
     ],
     FIELD_CODES: {
       VISIT_DATE: '受診日',
@@ -1609,6 +1635,60 @@ function normalizeReferralDeptOption(rawDept) {
 }
 
 /**
+ * 当院担当診療科および担当医師名を正規化する（現役医師11名・9診療科対応）
+ * 退職医（野田明生・佐藤恭一）や選択肢外の医師・診療科はドロップダウン値から除外し、
+ * 備考欄への退避テキスト（extraNote）として返すことで GAIA_FO01 エラーを防止する
+ *
+ * @param {string} rawDept
+ * @param {string} rawDoc
+ * @param {string=} inquiryCol
+ * @param {string=} remarksCol
+ * @return {{dept: string, doctor: string, extraNote: string}}
+ */
+function normalizeOurDeptAndDoctor(rawDept, rawDoc, inquiryCol, remarksCol) {
+  let doc = String(rawDoc || '').replace(/[\s\u3000]+/g, '').replace(/(先生|医師|Dr\.?)$/i, '');
+  let dept = String(rawDept || '').trim();
+  let extraNote = '';
+  // よくある誤字補正
+  if (doc === '大江陽介' || doc === '大江健一') doc = '大江健介';
+  if (doc === '田中準') doc = '田中淳';
+  if (doc === '佐々木威浩' || (!doc && String(inquiryCol || '').includes('佐々木'))) doc = '佐々木威治';
+  // 医師名から診療科の確定または補完（現役11名）
+  if (['溝上泰一朗', '尤郁偉', '劉軒'].includes(doc)) dept = '脳神経外科';
+  else if (['上床武史'].includes(doc)) dept = '脳血管内科';
+  else if (['田中淳'].includes(doc)) dept = '脳神経内科';
+  else if (['奈田慎一'].includes(doc)) dept = '血管外科';
+  else if (['吉原智仁', '泉政寛', '佐々木威治'].includes(doc)) dept = '整形外科';
+  else if (['大江健介'].includes(doc)) dept = dept.includes('循環器') ? '循環器内科' : '内科（一般）';
+  else if (['村山賢一郎'].includes(doc)) dept = dept.includes('消化器') ? '消化器内科' : '内科（一般）';
+  // 退職医（野田明生・佐藤恭一）は診療科だけ補完し、医師名は後段で備考へ退避
+  else if (doc === '野田明生') dept = '整形外科';
+  else if (doc === '佐藤恭一') dept = dept.includes('循環器') ? '循環器内科' : '内科（一般）';
+  else {
+    if (dept.includes('脳外')) dept = '脳神経外科';
+    else if (dept.includes('脳内')) dept = '脳神経内科';
+    else if (dept.includes('血管内科')) dept = '脳血管内科';
+    else if (dept.includes('血管外科') || dept.includes('血外')) dept = '血管外科';
+    else if (dept.includes('整形') || String(inquiryCol || '').includes('整形')) dept = '整形外科';
+    else if (dept.includes('循環器')) dept = '循環器内科';
+    else if (dept.includes('消化器') || (dept === '外科' && String(remarksCol || '').includes('胃カメラ'))) dept = '消化器内科';
+    else if (dept.includes('リハ')) dept = 'リハビリテーション科';
+    else if (dept.includes('内科') || dept === '外科') dept = '内科（一般）';
+  }
+  const validDepts = SANTE_CONFIG.KINTONE.OUR_DEPT_OPTIONS;
+  const validDoctors = SANTE_CONFIG.KINTONE.OUR_DOCTOR_OPTIONS;
+  if (dept && !validDepts.includes(dept)) {
+    extraNote += `当院科:${dept} `;
+    dept = '';
+  }
+  if (doc && !validDoctors.includes(doc)) {
+    extraNote += `旧/他担当医:${doc}`;
+    doc = '';
+  }
+  return { dept: dept, doctor: doc, extraNote: extraNote.trim() };
+}
+
+/**
  * 入力シートの1列分のデータから kintone POST 用の record オブジェクトを構築する
  * @param {{
  *   visitDate: string,
@@ -1623,6 +1703,7 @@ function normalizeReferralDeptOption(rawDept) {
  *   facilityDoctor: string,
  *   ourDept: string,
  *   ourDoctor: string,
+ *   inquiry?: string,
  *   replyStatus: string,
  *   replyDate: string,
  *   firstReportUrl: string,
@@ -1649,8 +1730,10 @@ function buildKintonePostRecordPayload(item, excludedFieldsSet) {
   setField(fc.PATIENT_NAME, String(item.patientName || ''));
 
   // 連携フェーズ および 既存アプリB互換の「連携方向」の両方にセット（未定義片方はAuto-Recoveryで自動除外）
-  const phaseVal = String(item.phase || '');
-  setField(fc.PHASE, phaseVal);
+  const phaseVal = String(item.phase || '').trim();
+  if (phaseVal) {
+    setField(fc.PHASE, phaseVal);
+  }
   if (
     phaseVal === SANTE_CONFIG.PHASES.FORWARD ||
     phaseVal === SANTE_CONFIG.PHASES.BACKWARD ||
@@ -1660,7 +1743,10 @@ function buildKintonePostRecordPayload(item, excludedFieldsSet) {
     setField(fc.DIRECTION, phaseVal);
   }
 
-  setField(fc.VISIT_TYPE, String(item.visitType || ''));
+  const visitTypeVal = String(item.visitType || '').trim();
+  if (visitTypeVal) {
+    setField(fc.VISIT_TYPE, visitTypeVal);
+  }
 
   // ルックアップキーが存在する場合は更新用キーのみをセットし、施設名はルックアップの自動コピーに任せる
   // ルックアップキーが空のときだけ自由入力として施設名をセットする
@@ -1681,16 +1767,43 @@ function buildKintonePostRecordPayload(item, excludedFieldsSet) {
   }
 
   setField(fc.FACILITY_DOCTOR, String(item.facilityDoctor || ''));
-  setField(fc.OUR_DEPT, String(item.ourDept || ''));
-  setField(fc.OUR_DOCTOR, String(item.ourDoctor || ''));
-  setField(fc.REPLY_STATUS, String(item.replyStatus || ''));
+
+  // 当院担当診療科・担当医師の11名正規化（空のドロップダウン値は送信せず、退職医・選択肢外は備考へ退避）
+  const rawRemarks = String(item.remarks || '').trim();
+  const normalizedOur = normalizeOurDeptAndDoctor(
+    item.ourDept,
+    item.ourDoctor,
+    item.inquiry || '',
+    rawRemarks
+  );
+  if (normalizedOur.dept) {
+    setField(fc.OUR_DEPT, normalizedOur.dept);
+  }
+  if (normalizedOur.doctor) {
+    setField(fc.OUR_DOCTOR, normalizedOur.doctor);
+  }
+
+  const replyStatusVal = String(item.replyStatus || '').trim();
+  if (replyStatusVal) {
+    setField(fc.REPLY_STATUS, replyStatusVal);
+  }
 
   if (item.replyDate) {
     setField(fc.REPLY_DATE, formatDateYMD(item.replyDate));
   }
   setField(fc.FIRST_REPORT_URL, String(item.firstReportUrl || ''));
-  setField(fc.FAX_STATUS, String(item.faxStatus || ''));
-  setField(fc.REMARKS, String(item.remarks || ''));
+  const faxStatusVal = String(item.faxStatus || '').trim();
+  if (faxStatusVal) {
+    setField(fc.FAX_STATUS, faxStatusVal);
+  }
+
+  let finalRemarks = rawRemarks;
+  if (normalizedOur.extraNote && !finalRemarks.includes(normalizedOur.extraNote)) {
+    finalRemarks = finalRemarks
+      ? `${finalRemarks} / ${normalizedOur.extraNote}`
+      : normalizedOur.extraNote;
+  }
+  setField(fc.REMARKS, finalRemarks);
 
   return record;
 }
@@ -2610,6 +2723,553 @@ function setupReminderScheduleTrigger() {
 }
 
 // ============================================================================
+// FILE: src/PastDataMigration.js
+// ============================================================================
+/**
+ * @fileoverview 過去データ移行モジュール（全月タブ合体・返書ステータス4段階自動判定・BOM付UTF-8 CSV出力・kintone一括POST＆台帳反映）
+ * サンテ溝上病院 地域連携・紹介返書管理＆第一報自動化システム (SANTE-BRIDGE)
+ */
+
+const PAST_MIGRATION_HEADERS = Object.freeze([
+  '受診日',
+  '患者ID',
+  '患者氏名',
+  '連携方向',
+  '連携フェーズ',
+  '受入・送出形態',
+  '更新用キー',
+  '連携先施設名_0',
+  '連携先診療科',
+  '紹介先診療科',
+  '連携先医師名',
+  '当院担当診療科',
+  '担当医師',
+  '返書日',
+  '返書ステータス',
+  '備考・連絡事項',
+]);
+
+/**
+ * 過去データ走査対象から除外すべきシート名かを判定する
+ * @param {string} sheetName
+ * @return {boolean}
+ */
+function isExcludedFromPastMigration(sheetName) {
+  const name = String(sheetName || '').trim();
+  if (!name) return true;
+
+  const migrationSheetName =
+    (SANTE_CONFIG.SHEETS && SANTE_CONFIG.SHEETS.PAST_MIGRATION) ||
+    '【kintone一括登録用】紹介・逆紹介';
+
+  if (
+    name === migrationSheetName ||
+    name === SANTE_CONFIG.SHEETS.INPUT ||
+    name === SANTE_CONFIG.SHEETS.FACILITY_MASTER ||
+    name.endsWith(SANTE_CONFIG.SHEETS.LEDGER_SUFFIX)
+  ) {
+    return true;
+  }
+
+  if (/^(集計|設定|マスタ|テンプレート|readme|log)/i.test(name)) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * 過去データの1行から連携方向・連携フェーズおよび返書ステータス（4段階）を自動判定する純粋関数
+ *
+ * 優先順:
+ * 1. row[12]（問い合わせ）に「逆紹介」または「送出」を含む → 後方（逆紹介・送出） / 対象外
+ * 2. 上記以外で、返書日が非空 または row[10] === '済' → 前方（紹介・受入） / 作成・送付完了
+ * 3. 上記以外で、row[12] または row[13] が /(書かない|返書なし|不要|記載不要|中止|キャンセル|死亡|終診|閉院)/ にマッチ → 前方（紹介・受入） / 返書不要（医師判断）
+ * 4. 上記以外 → 前方（紹介・受入） / 未作成
+ *
+ * @param {string|Date} rawReplyDate row[9] 返書日
+ * @param {string} rawDoneFlag row[10] 済/未
+ * @param {string} rawInquiry row[12] 問い合わせ
+ * @param {string} rawRemarks row[13] 備考
+ * @return {{direction: string, phase: string, replyStatus: string, replyDate: string}}
+ */
+function classifyPastRecordReplyStatus(rawReplyDate, rawDoneFlag, rawInquiry, rawRemarks) {
+  const replyDate = formatDateYMD(rawReplyDate);
+  const doneFlag = String(rawDoneFlag || '').trim();
+  const inquiry = String(rawInquiry || '').trim();
+  const remarks = String(rawRemarks || '').trim();
+
+  // 1. 逆紹介・送出 → 後方 / 対象外
+  if (inquiry.includes('逆紹介') || inquiry.includes('送出')) {
+    return {
+      direction: SANTE_CONFIG.PHASES.BACKWARD,
+      phase: SANTE_CONFIG.PHASES.BACKWARD,
+      replyStatus: SANTE_CONFIG.REPLY_STATUS.NOT_APPLICABLE,
+      replyDate: replyDate,
+    };
+  }
+
+  const forward = SANTE_CONFIG.PHASES.FORWARD;
+
+  // 2. 返書日が非空 または 済/未が「済」 → 作成・送付完了
+  if (replyDate !== '' || doneFlag === '済') {
+    return {
+      direction: forward,
+      phase: forward,
+      replyStatus: SANTE_CONFIG.REPLY_STATUS.COMPLETED,
+      replyDate: replyDate,
+    };
+  }
+
+  // 3. 問い合わせ・備考が不要系キーワードにマッチ → 返書不要（医師判断）
+  const combinedNotes = `${inquiry} ${remarks}`;
+  if (/(書かない|返書なし|不要|記載不要|中止|キャンセル|死亡|終診|閉院)/.test(combinedNotes)) {
+    return {
+      direction: forward,
+      phase: forward,
+      replyStatus: SANTE_CONFIG.REPLY_STATUS.NOT_REQUIRED,
+      replyDate: '',
+    };
+  }
+
+  // 4. 上記以外 → 未作成
+  return {
+    direction: forward,
+    phase: forward,
+    replyStatus: SANTE_CONFIG.REPLY_STATUS.UNCREATED,
+    replyDate: '',
+  };
+}
+
+/**
+ * 過去月別タブの1行（0始まり row[0]〜row[13]）を移行シート用の16列データへ変換する純粋関数
+ * @param {Array<*>} row
+ * @param {Array<Object>} facilityMasterList
+ * @return {{
+ *   rowArray: Array<string>,
+ *   replyStatus: string,
+ *   phase: string
+ * }|null}
+ */
+function transformPastSheetRow(row, facilityMasterList) {
+  if (!row || !Array.isArray(row)) return null;
+
+  const rawVisitDate = row[0];
+  const visitDate = formatDateYMD(rawVisitDate);
+  if (!visitDate || visitDate === '来院日' || !/^\d{4}-\d{2}-\d{2}$/.test(visitDate)) {
+    return null;
+  }
+
+  const patientId = String(row[1] !== undefined && row[1] !== null ? row[1] : '').trim();
+  const patientName = String(row[2] !== undefined && row[2] !== null ? row[2] : '').trim();
+  if (!patientId && !patientName) {
+    return null;
+  }
+
+  // row[3]: 紹介元病院名 → resolveFacility で名寄せ（完全一致／コア一致のみ更新用キーを採用）
+  const rawFacilityName = String(row[3] || '').trim();
+  const resolvedFacility = resolveFacility(rawFacilityName, facilityMasterList || []);
+  const isConfirmedFacility =
+    (resolvedFacility.matchType === 'exact' || resolvedFacility.matchType === 'core') &&
+    Boolean(resolvedFacility.lookupKey);
+
+  const lookupKey = isConfirmedFacility ? resolvedFacility.lookupKey : '';
+  const facilityName0 = isConfirmedFacility
+    ? resolvedFacility.officialName || rawFacilityName
+    : rawFacilityName;
+
+  // row[4]: 紹介元診療科 → 連携先診療科（自由記述）＋ 紹介先診療科（5択合致時のみ）
+  const facilityDept = String(row[4] || '').trim();
+  const referralDept = normalizeReferralDeptOption(facilityDept);
+
+  // row[5]: 紹介元医師名（空白除去）
+  const facilityDoctor = String(row[5] || '')
+    .replace(/[\s\u3000]+/g, '')
+    .trim();
+
+  // row[6]: 受入・送出形態（外来 / 入院 / 検査）
+  const visitType = normalizeVisitTypeValue(row[6]);
+
+  // row[7], row[8]: 当院診療科・医師（現役11名・9診療科正規化）
+  const rawInquiry = String(row[12] || '').trim();
+  const rawRemarks = String(row[13] || '').trim();
+  const ourNormalized = normalizeOurDeptAndDoctor(row[7], row[8], rawInquiry, rawRemarks);
+
+  // row[9]: 返書日, row[10]: 済/未, row[12]: 問い合わせ, row[13]: 備考 → 4段階自動判定
+  const statusInfo = classifyPastRecordReplyStatus(row[9], row[10], rawInquiry, rawRemarks);
+
+  // 備考・連絡事項の組み立て（問い合わせ・備考・部分一致施設名退避・退職医/他科退避）
+  const remarkParts = [];
+  if (rawInquiry) remarkParts.push(rawInquiry);
+  if (rawRemarks) remarkParts.push(rawRemarks);
+  if (rawFacilityName && !isConfirmedFacility) {
+    remarkParts.push(`施設名(マスタ未確定):${rawFacilityName}`);
+  }
+  if (ourNormalized.extraNote) {
+    remarkParts.push(ourNormalized.extraNote);
+  }
+  const combinedRemarks = remarkParts.join(' / ');
+
+  const rowArray = [
+    visitDate,              // 0: 受診日
+    patientId,              // 1: 患者ID
+    patientName,            // 2: 患者氏名
+    statusInfo.direction,   // 3: 連携方向
+    statusInfo.phase,       // 4: 連携フェーズ
+    visitType,              // 5: 受入・送出形態
+    lookupKey,              // 6: 更新用キー
+    facilityName0,          // 7: 連携先施設名_0
+    facilityDept,           // 8: 連携先診療科
+    referralDept,           // 9: 紹介先診療科
+    facilityDoctor,         // 10: 連携先医師名
+    ourNormalized.dept,     // 11: 当院担当診療科
+    ourNormalized.doctor,   // 12: 担当医師
+    statusInfo.replyDate,   // 13: 返書日
+    statusInfo.replyStatus, // 14: 返書ステータス
+    combinedRemarks,        // 15: 備考・連絡事項
+  ];
+
+  return {
+    rowArray: rowArray,
+    replyStatus: statusInfo.replyStatus,
+    phase: statusInfo.phase,
+  };
+}
+
+/**
+ * 【タスク4-1】スプレッドシート内の過去月別タブ（「来院日」ヘッダーを持つシート）を走査・合体し、
+ * 返書ステータス4段階自動判定と11名医師正規化を行った上で
+ * 『【kintone一括登録用】紹介・逆紹介』シートを生成する
+ *
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet=} ss
+ * @return {{
+ *   totalCount: number,
+ *   countsByStatus: Object<string, number>,
+ *   processedSheets: Array<string>
+ * }}
+ */
+function buildPastDataMigrationSheet(ss) {
+  const spreadsheet = ss || SpreadsheetApp.getActiveSpreadsheet();
+  const facilityMasterList = loadFacilityMasterList(spreadsheet);
+  const allSheets = spreadsheet.getSheets ? spreadsheet.getSheets() : [];
+
+  const outputRows = [];
+  const processedSheets = [];
+  const countsByStatus = {
+    [SANTE_CONFIG.REPLY_STATUS.COMPLETED]: 0,
+    [SANTE_CONFIG.REPLY_STATUS.NOT_REQUIRED]: 0,
+    [SANTE_CONFIG.REPLY_STATUS.UNCREATED]: 0,
+    [SANTE_CONFIG.REPLY_STATUS.NOT_APPLICABLE]: 0,
+  };
+
+  allSheets.forEach((sheet) => {
+    const sheetName = sheet.getName();
+    if (isExcludedFromPastMigration(sheetName)) {
+      return;
+    }
+
+    const lastRow = sheet.getLastRow();
+    const lastCol = sheet.getLastColumn();
+    if (lastRow < 2 || lastCol < 4) {
+      return;
+    }
+
+    const numCols = Math.max(lastCol, 14);
+    const values = sheet.getRange(1, 1, lastRow, numCols).getValues();
+
+    // 先頭5行以内に「来院日」ヘッダーがあるか探す
+    let headerRowIdx = -1;
+    const maxHeaderScan = Math.min(values.length, 5);
+    for (let r = 0; r < maxHeaderScan; r++) {
+      const firstCells = values[r].slice(0, 4).map((v) => String(v || '').trim());
+      if (firstCells.includes('来院日')) {
+        headerRowIdx = r;
+        break;
+      }
+    }
+
+    if (headerRowIdx === -1) {
+      return;
+    }
+
+    processedSheets.push(sheetName);
+
+    for (let r = headerRowIdx + 1; r < values.length; r++) {
+      const transformed = transformPastSheetRow(values[r], facilityMasterList);
+      if (!transformed) continue;
+
+      outputRows.push(transformed.rowArray);
+      if (countsByStatus[transformed.replyStatus] !== undefined) {
+        countsByStatus[transformed.replyStatus]++;
+      } else {
+        countsByStatus[transformed.replyStatus] = 1;
+      }
+    }
+  });
+
+  const migrationSheetName =
+    (SANTE_CONFIG.SHEETS && SANTE_CONFIG.SHEETS.PAST_MIGRATION) ||
+    '【kintone一括登録用】紹介・逆紹介';
+
+  let outSheet = spreadsheet.getSheetByName(migrationSheetName);
+  if (!outSheet) {
+    outSheet = spreadsheet.insertSheet(migrationSheetName);
+  } else if (outSheet.clear) {
+    outSheet.clear();
+  }
+
+  const headerRange = outSheet.getRange(1, 1, 1, PAST_MIGRATION_HEADERS.length);
+  headerRange
+    .setValues([Array.from(PAST_MIGRATION_HEADERS)])
+    .setBackground('#0F4C5C')
+    .setFontColor('#FFFFFF')
+    .setFontWeight('bold')
+    .setHorizontalAlignment('center');
+  outSheet.setFrozenRows(1);
+
+  if (outputRows.length > 0) {
+    // 患者ID列（2列目）と受診日列（1列目）・返書日列（14列目）を文字列書式に維持
+    outSheet.getRange(2, 1, outputRows.length, 2).setNumberFormat('@');
+    outSheet.getRange(2, 14, outputRows.length, 1).setNumberFormat('@');
+    outSheet
+      .getRange(2, 1, outputRows.length, PAST_MIGRATION_HEADERS.length)
+      .setValues(outputRows);
+  }
+
+  const summaryText = [
+    `対象シート数: ${processedSheets.length}タブ`,
+    `抽出合計: ${outputRows.length}件`,
+    `・作成・送付完了: ${countsByStatus[SANTE_CONFIG.REPLY_STATUS.COMPLETED]}件`,
+    `・返書不要（医師判断）: ${countsByStatus[SANTE_CONFIG.REPLY_STATUS.NOT_REQUIRED]}件`,
+    `・未作成: ${countsByStatus[SANTE_CONFIG.REPLY_STATUS.UNCREATED]}件`,
+    `・対象外（逆紹介等）: ${countsByStatus[SANTE_CONFIG.REPLY_STATUS.NOT_APPLICABLE]}件`,
+  ].join('\n');
+
+  try {
+    if (SpreadsheetApp.getUi) {
+      SpreadsheetApp.getUi().alert(
+        '✅ 過去データ移行シート作成完了',
+        `シート「${migrationSheetName}」を作成しました。\n\n${summaryText}`,
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+    } else {
+      spreadsheet.toast(summaryText.replace(/\n/g, ' / '), '✅ 過去データ整形完了', 8);
+    }
+  } catch (_) {
+    spreadsheet.toast(summaryText.replace(/\n/g, ' / '), '✅ 過去データ整形完了', 8);
+  }
+
+  return {
+    totalCount: outputRows.length,
+    countsByStatus: countsByStatus,
+    processedSheets: processedSheets,
+  };
+}
+
+/**
+ * 2次元配列から BOM 付き UTF-8（先頭 \uFEFF）の CSV 文字列を生成する純粋関数
+ * @param {Array<Array<*>>} matrix
+ * @return {string}
+ */
+function buildMigrationCsvContent(matrix) {
+  if (!matrix || matrix.length === 0) {
+    return '\uFEFF';
+  }
+
+  const escapeCsvCell = (val) => {
+    if (val === null || val === undefined) return '';
+    const str = val instanceof Date ? formatDateYMD(val) : String(val);
+    if (/[",\r\n]/.test(str)) {
+      return `"${str.replace(/"/g, '""')}"`;
+    }
+    return str;
+  };
+
+  const lines = matrix.map((row) => row.map(escapeCsvCell).join(','));
+  return '\uFEFF' + lines.join('\r\n');
+}
+
+/**
+ * 【タスク4-2】『【kintone一括登録用】紹介・逆紹介』の内容を
+ * BOM 付き UTF-8 の CSV として HtmlService モーダル経由でダウンロードする
+ *
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet=} ss
+ * @return {{csvContent: string, rowCount: number}}
+ */
+function downloadMigrationCsv(ss) {
+  const spreadsheet = ss || SpreadsheetApp.getActiveSpreadsheet();
+  const migrationSheetName =
+    (SANTE_CONFIG.SHEETS && SANTE_CONFIG.SHEETS.PAST_MIGRATION) ||
+    '【kintone一括登録用】紹介・逆紹介';
+  const sheet = spreadsheet.getSheetByName(migrationSheetName);
+
+  if (!sheet || sheet.getLastRow() < 2) {
+    throw new Error(
+      `シート「${migrationSheetName}」にデータがありません。先に「1️⃣ 全月タブ合体＆返書ステータス自動判定シート作成」を実行してください。`
+    );
+  }
+
+  const lastRow = sheet.getLastRow();
+  const matrix = sheet
+    .getRange(1, 1, lastRow, PAST_MIGRATION_HEADERS.length)
+    .getValues();
+  const csvContent = buildMigrationCsvContent(matrix);
+  const base64Csv = Utilities.base64Encode(csvContent, Utilities.Charset.UTF_8);
+  const fileName = `sante_past_migration_${formatDateYMD(new Date())}.csv`;
+
+  const htmlString = [
+    '<!DOCTYPE html>',
+    '<html><head><meta charset="utf-8"></head>',
+    '<body style="font-family: sans-serif; padding: 16px; text-align: center;">',
+    `<p>全 <b>${lastRow - 1}件</b> の移行用CSV（BOM付UTF-8）を準備しました。</p>`,
+    `<a id="dlLink" href="data:text/csv;charset=utf-8;base64,${base64Csv}" download="${fileName}" `,
+    'style="display:inline-block;padding:10px 20px;background:#0F4C5C;color:#fff;text-decoration:none;border-radius:4px;font-weight:bold;">',
+    '📥 CSVファイルをダウンロード</a>',
+    '<script>document.getElementById("dlLink").click();</script>',
+    '</body></html>',
+  ].join('');
+
+  if (typeof HtmlService !== 'undefined' && SpreadsheetApp.getUi) {
+    const htmlOutput = HtmlService.createHtmlOutput(htmlString)
+      .setWidth(420)
+      .setHeight(180);
+    SpreadsheetApp.getUi().showModalDialog(htmlOutput, '📥 移行用CSVダウンロード（BOM付UTF-8）');
+  }
+
+  return {
+    csvContent: csvContent,
+    rowCount: lastRow - 1,
+  };
+}
+
+/**
+ * 【タスク4-3】『【kintone一括登録用】紹介・逆紹介』のデータを読み取り、
+ * ルックアップ自動コピー先の「連携先施設名_0」や空の日付・空のドロップダウン項目を除外した上で、
+ * 100件単位で kintone アプリBへ一括 POST し、発番された ids とともに年度別連携台帳へも同時反映する
+ *
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet=} ss
+ * @return {{postedCount: number, ledgerAppendedCount: number, ids: Array<string>}}
+ */
+function sendPastDataToKintoneAppB(ss) {
+  const spreadsheet = ss || SpreadsheetApp.getActiveSpreadsheet();
+  const migrationSheetName =
+    (SANTE_CONFIG.SHEETS && SANTE_CONFIG.SHEETS.PAST_MIGRATION) ||
+    '【kintone一括登録用】紹介・逆紹介';
+  const sheet = spreadsheet.getSheetByName(migrationSheetName);
+
+  if (!sheet || sheet.getLastRow() < 2) {
+    throw new Error(
+      `シート「${migrationSheetName}」にデータがありません。先に「1️⃣ 全月タブ合体＆返書ステータス自動判定シート作成」を実行してください。`
+    );
+  }
+
+  const lastRow = sheet.getLastRow();
+  const rows = sheet
+    .getRange(2, 1, lastRow - 1, PAST_MIGRATION_HEADERS.length)
+    .getValues();
+
+  const nowStr = formatDateTimeNow();
+  const migrationRecords = [];
+
+  rows.forEach((row) => {
+    const visitDate = formatDateYMD(row[0]);
+    const patientId = String(row[1] || '').trim();
+    const patientName = String(row[2] || '').trim();
+    if (!visitDate && !patientId && !patientName) return;
+
+    const phaseVal = String(row[4] || row[3] || SANTE_CONFIG.PHASES.FORWARD).trim();
+    const visitTypeVal = String(row[5] || '').trim();
+    const lookupKeyVal = String(row[6] || '').trim();
+    const displayFacilityName = String(row[7] || '').trim(); // 連携先施設名_0（台帳記録用）
+    const facilityDeptVal = String(row[8] || '').trim();
+    const referralDeptVal = String(row[9] || '').trim();
+    const facilityDoctorVal = String(row[10] || '').trim();
+    const ourDeptVal = String(row[11] || '').trim();
+    const ourDoctorVal = String(row[12] || '').trim();
+    const replyDateVal = formatDateYMD(row[13]);
+    const replyStatusVal = String(row[14] || '').trim();
+    const remarksVal = String(row[15] || '').trim();
+
+    migrationRecords.push({
+      registeredAt: nowStr,
+      visitDate: visitDate,
+      patientId: patientId,
+      patientName: patientName,
+      phase: phaseVal,
+      visitType: visitTypeVal,
+      lookupKey: lookupKeyVal,
+      // 連携先施設名_0 はルックアップコピー先のため kintone POST ペイロードからは除外（空文字）
+      facilityName: '',
+      _ledgerFacilityName: displayFacilityName,
+      facilityDept: facilityDeptVal,
+      referralDept: referralDeptVal,
+      facilityDoctor: facilityDoctorVal,
+      ourDept: ourDeptVal,
+      ourDoctor: ourDoctorVal,
+      replyStatus: replyStatusVal,
+      replyDate: replyDateVal,
+      firstReportUrl: '',
+      faxStatus: '', // 空のドロップダウン項目は送信しない
+      remarks: remarksVal,
+    });
+  });
+
+  if (migrationRecords.length === 0) {
+    return { postedCount: 0, ledgerAppendedCount: 0, ids: [] };
+  }
+
+  try {
+    // 1. 既存の postRecordsToKintoneBatch（100件分割・Auto-Recovery付）で kintone アプリBへ一括登録
+    const postResult = postRecordsToKintoneBatch(migrationRecords);
+    const issuedIds = postResult.ids || [];
+
+    // 2. 返却されたレコードIDを付与して年度別連携台帳へ一括追記（5重ロック・リマインド連動）
+    const ledgerRecords = migrationRecords.map((rec, idx) => ({
+      kintoneRecordId: issuedIds[idx] || '',
+      registeredAt: rec.registeredAt,
+      visitDate: rec.visitDate,
+      patientId: rec.patientId,
+      patientName: rec.patientName,
+      phase: rec.phase,
+      visitType: rec.visitType,
+      lookupKey: rec.lookupKey,
+      facilityName: rec._ledgerFacilityName,
+      facilityDept: rec.facilityDept,
+      facilityDoctor: rec.facilityDoctor,
+      ourDept: rec.ourDept,
+      ourDoctor: rec.ourDoctor,
+      replyStatus: rec.replyStatus,
+      replyDate: rec.replyDate,
+      firstReportUrl: '',
+      faxStatus: SANTE_CONFIG.FAX_STATUS.NOT_REQUIRED,
+      remarks: rec.remarks,
+    }));
+
+    const appendedMeta = appendRecordsToLedger(ledgerRecords, spreadsheet);
+
+    const doneMsg = `過去データ ${migrationRecords.length}件 を kintone アプリBへ一括登録し、年度別連携台帳へ ${appendedMeta.length}件 反映しました。`;
+    spreadsheet.toast(doneMsg, '🎉 過去データ一括移行完了', 8);
+
+    return {
+      postedCount: migrationRecords.length,
+      ledgerAppendedCount: appendedMeta.length,
+      ids: issuedIds,
+    };
+  } catch (err) {
+    notifySlackError(
+      '過去データkintone一括移行 (sendPastDataToKintoneAppB) 異常終了',
+      err,
+      {
+        targetRecordCount: String(migrationRecords.length),
+      },
+      { includeStack: false }
+    );
+    spreadsheet.toast(`過去データ移行エラー: ${err.message}`, '🚨 移行中断', 10);
+    throw err;
+  }
+}
+
+// ============================================================================
 // FILE: src/Code.js
 // ============================================================================
 /**
@@ -2630,6 +3290,13 @@ function onOpen() {
     .addItem('📢 未返書リストを今すぐ通知（LINE WORKS / Slack）', 'sendUnrepliedRemindersManual')
     .addItem('🧹 送信完了・処理済列のクリア整理', 'clearCompletedColumns')
     .addSeparator()
+    .addSubMenu(
+      ui
+        .createMenu('🛠️ 返書管理・過去データ移行')
+        .addItem('1️⃣ 全月タブ合体＆返書ステータス自動判定シート作成', 'buildPastDataMigrationSheet')
+        .addItem('2️⃣ 移行用CSVダウンロード（BOM付UTF-8）', 'downloadMigrationCsv')
+        .addItem('3️⃣ kintoneアプリBへ一括POST＋年度別台帳反映', 'sendPastDataToKintoneAppB')
+    )
     .addSubMenu(
       ui
         .createMenu('⚙️ 初期設定・メンテナンス')
@@ -2763,7 +3430,7 @@ function normalizePhaseValue(rawPhase) {
 }
 
 /**
- * 受入・送出形態を「外来」または「入院」に正規化する
+ * 受入・送出形態を「外来」「入院」「検査」に正規化する
  * @param {string} rawType
  * @return {string}
  */
@@ -2772,7 +3439,36 @@ function normalizeVisitTypeValue(rawType) {
   if (s.includes('入院')) {
     return SANTE_CONFIG.VISIT_TYPES.INPATIENT;
   }
+  if (s.includes('検査') && SANTE_CONFIG.VISIT_TYPES.EXAM) {
+    return SANTE_CONFIG.VISIT_TYPES.EXAM;
+  }
   return SANTE_CONFIG.VISIT_TYPES.OUTPATIENT;
+}
+
+/**
+ * 連携フェーズと備考・連絡事項から、新規登録時の初期「返書ステータス」を決定する
+ * - 前方（紹介・受入）かつ備考が /(返書不要|書かない|返書なし|記載不要)/ にマッチ: 返書不要（医師判断）
+ * - 前方（紹介・受入）で上記以外: 未作成
+ * - それ以外（後方など）: 対象外
+ *
+ * @param {string} phase
+ * @param {string=} remarks
+ * @return {string}
+ */
+function decideInitialReplyStatus(phase, remarks) {
+  const phaseStr = String(phase || '').trim();
+  const isForward =
+    phaseStr === SANTE_CONFIG.PHASES.FORWARD || phaseStr.startsWith('前方');
+  if (!isForward) {
+    return SANTE_CONFIG.REPLY_STATUS.NOT_APPLICABLE;
+  }
+
+  const remarksStr = String(remarks || '').trim();
+  if (/(返書不要|書かない|返書なし|記載不要)/.test(remarksStr)) {
+    return SANTE_CONFIG.REPLY_STATUS.NOT_REQUIRED;
+  }
+
+  return SANTE_CONFIG.REPLY_STATUS.UNCREATED;
 }
 
 /**
@@ -2943,11 +3639,15 @@ function applyInputColumnValidations(inputSheet, startCol, numCols) {
   inputSheet.getRange(rows.PHASE, startCol, 1, numCols).setDataValidation(phaseRule);
 
   // 9行目: 受入・送出形態 プルダウン
+  const visitTypeOptions = [
+    SANTE_CONFIG.VISIT_TYPES.OUTPATIENT,
+    SANTE_CONFIG.VISIT_TYPES.INPATIENT,
+  ];
+  if (SANTE_CONFIG.VISIT_TYPES.EXAM) {
+    visitTypeOptions.push(SANTE_CONFIG.VISIT_TYPES.EXAM);
+  }
   const visitTypeRule = SpreadsheetApp.newDataValidation()
-    .requireValueInList(
-      [SANTE_CONFIG.VISIT_TYPES.OUTPATIENT, SANTE_CONFIG.VISIT_TYPES.INPATIENT],
-      true
-    )
+    .requireValueInList(visitTypeOptions, true)
     .setAllowInvalid(true)
     .build();
   inputSheet.getRange(rows.VISIT_TYPE, startCol, 1, numCols).setDataValidation(visitTypeRule);
@@ -3226,6 +3926,7 @@ function executeBatchProcess() {
   let kintonePosted = 0;
   let kintonePutUpdated = 0;
   let ledgerUpdated = 0;
+  const syncedColNumbersSet = new Set();
 
   try {
     // =========================================================================
@@ -3287,10 +3988,19 @@ function executeBatchProcess() {
           }
         }
 
-        const isForward = colData.phase === SANTE_CONFIG.PHASES.FORWARD;
-        const replyStatus = isForward
-          ? SANTE_CONFIG.REPLY_STATUS.UNCREATED
-          : SANTE_CONFIG.REPLY_STATUS.NOT_APPLICABLE;
+        const replyStatus = decideInitialReplyStatus(colData.phase, colData.remarks);
+        const normalizedOur = normalizeOurDeptAndDoctor(
+          colData.ourDept,
+          colData.ourDoctor,
+          '',
+          colData.remarks
+        );
+        let mergedRemarks = String(colData.remarks || '').trim();
+        if (normalizedOur.extraNote && !mergedRemarks.includes(normalizedOur.extraNote)) {
+          mergedRemarks = mergedRemarks
+            ? `${mergedRemarks} / ${normalizedOur.extraNote}`
+            : normalizedOur.extraNote;
+        }
 
         let faxStatus = SANTE_CONFIG.FAX_STATUS.NOT_REQUIRED;
         if (colData.faxSent) {
@@ -3301,6 +4011,7 @@ function executeBatchProcess() {
 
         return {
           _colData: colData,
+          _matchType: resolved.matchType,
           registeredAt: nowStr,
           visitDate: colData.visitDate,
           patientId: colData.patientId,
@@ -3311,13 +4022,13 @@ function executeBatchProcess() {
           facilityName: officialFacilityName,
           facilityDept: colData.facilityDept,
           facilityDoctor: colData.facilityDoctor,
-          ourDept: colData.ourDept,
-          ourDoctor: colData.ourDoctor,
+          ourDept: normalizedOur.dept,
+          ourDoctor: normalizedOur.doctor,
           replyStatus: replyStatus,
           replyDate: '',
           firstReportUrl: colData.reportDocUrl,
           faxStatus: faxStatus,
-          remarks: colData.remarks,
+          remarks: mergedRemarks,
         };
       });
 
@@ -3334,7 +4045,7 @@ function executeBatchProcess() {
       appendRecordsToLedger(ledgerRowsToAppend, ss);
       kintonePosted = ledgerRowsToAppend.length;
 
-      // 入力シートのステータスを「✅ kintone反映済」に更新
+      // 入力シートのステータスを「✅ kintone反映済」に更新（部分一致保留以外の列は自動クリア対象に追加）
       postRecordsPayload.forEach((item, idx) => {
         const colNum = item._colData.colNumber;
         const recId = issuedIds[idx] || '';
@@ -3346,6 +4057,9 @@ function executeBatchProcess() {
           .getRange(rows.VISIT_DATE, colNum)
           .setNote(`kintone登録済: レコードID #${recId} (${nowStr})`);
         item._colData.syncStatus = SANTE_CONFIG.COLUMN_SYNC_STATUS.SYNCED;
+        if (item._matchType !== 'partial') {
+          syncedColNumbersSet.add(colNum);
+        }
       });
     }
 
@@ -3407,11 +4121,26 @@ function executeBatchProcess() {
           .getRange(statusRow, colNum)
           .setValue(SANTE_CONFIG.COLUMN_SYNC_STATUS.SYNCED)
           .setBackground('#d9ead3');
+
+        const resolvedFacility = resolveFacility(item.colData.facilityName, facilityMasterList);
+        if (resolvedFacility.matchType !== 'partial') {
+          syncedColNumbersSet.add(colNum);
+        }
       });
     }
 
+    // Step 4: 今回の一括実行でkintone連携・台帳反映が成功した列（および C2:C3）を自動クリア
+    let autoClearedCount = 0;
+    if (syncedColNumbersSet.size > 0) {
+      const clearRes = clearSyncedInputColumnsAfterBatch(
+        inputSheet,
+        Array.from(syncedColNumbersSet)
+      );
+      autoClearedCount = clearRes.clearedCount;
+    }
+
     // 完了通知（トースト ＆ Slack通知）
-    const summaryMsg = `第一報生成: ${docsGenerated}件 / kintone新規POST: ${kintonePosted}件 / 返書消込PUT: ${kintonePutUpdated}件 (台帳消込: ${ledgerUpdated}件)`;
+    const summaryMsg = `第一報生成: ${docsGenerated}件 / kintone新規POST: ${kintonePosted}件 / 返書消込PUT: ${kintonePutUpdated}件 (台帳消込: ${ledgerUpdated}件)。生成した第一報URLや登録内容は年度別連携台帳タブに記録され、入力シートの完了列をクリアしました（${autoClearedCount}列）。`;
     ss.toast(summaryMsg, '🎉 SANTE-BRIDGE 一括処理完了', 8);
 
     if (docsGenerated > 0 || kintonePosted > 0 || kintonePutUpdated > 0) {
@@ -3428,6 +4157,7 @@ function executeBatchProcess() {
       kintonePosted,
       kintonePutUpdated,
       ledgerUpdated,
+      autoClearedCount,
     };
   } catch (err) {
     notifySlackError(
@@ -3535,6 +4265,57 @@ function reRunFiveLockMatchingForAllColumns() {
   });
 
   ss.toast(`全列の再照合が完了しました（ヒット: ${matchedCount}件）`, '🔍 5重ロック再照合完了', 6);
+}
+
+/**
+ * 一括実行（executeBatchProcess）で kintone 送信および年度別連携台帳への反映が成功した列について、
+ * 4行目ステータス、5〜19行目の値・背景色・セルNote、および C2:C3 貼付セルを自動クリアし、
+ * 15行目・17行目のチェックボックスを false にリセットする
+ * （エラー列・未処理列・施設名部分一致保留列はそのまま残す）
+ *
+ * @param {GoogleAppsScript.Spreadsheet.Sheet=} inputSheet
+ * @param {Array<number>} syncedColNumbers 今回同期に成功した1-based列番号配列
+ * @return {{clearedCount: number, clearedColumns: Array<number>, pasteRangeCleared: boolean}}
+ */
+function clearSyncedInputColumnsAfterBatch(inputSheet, syncedColNumbers) {
+  const sheet =
+    inputSheet ||
+    SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SANTE_CONFIG.SHEETS.INPUT);
+  if (!sheet) {
+    return { clearedCount: 0, clearedColumns: [], pasteRangeCleared: false };
+  }
+
+  const pasteRange = sheet.getRange(SANTE_CONFIG.INPUT_LAYOUT.PASTE_RANGE);
+  pasteRange.clearContent();
+
+  const uniqueCols = Array.from(
+    new Set((syncedColNumbers || []).map((n) => Number(n)).filter((n) => n >= 3))
+  );
+  if (uniqueCols.length === 0) {
+    return { clearedCount: 0, clearedColumns: [], pasteRangeCleared: true };
+  }
+
+  const statusRow = SANTE_CONFIG.INPUT_LAYOUT.STATUS_ROW;
+  const rowEnd = SANTE_CONFIG.INPUT_LAYOUT.ROW_END;
+  const totalRows = rowEnd - statusRow + 1; // 4〜19行目 (16行)
+  const rows = SANTE_CONFIG.INPUT_LAYOUT.ROWS;
+
+  uniqueCols.forEach((colNum) => {
+    const colRange = sheet.getRange(statusRow, colNum, totalRows, 1);
+    colRange.clearContent();
+    colRange.setBackground(null);
+    colRange.clearNote();
+
+    // 15行目・17行目のチェックボックスを false へ戻す
+    sheet.getRange(rows.NEED_FIRST_REPORT, colNum).setValue(false);
+    sheet.getRange(rows.FAX_SENT, colNum).setValue(false);
+  });
+
+  return {
+    clearedCount: uniqueCols.length,
+    clearedColumns: uniqueCols,
+    pasteRangeCleared: true,
+  };
 }
 
 /**

@@ -18,6 +18,13 @@ function onOpen() {
     .addSeparator()
     .addSubMenu(
       ui
+        .createMenu('🛠️ 返書管理・過去データ移行')
+        .addItem('1️⃣ 全月タブ合体＆返書ステータス自動判定シート作成', 'buildPastDataMigrationSheet')
+        .addItem('2️⃣ 移行用CSVダウンロード（BOM付UTF-8）', 'downloadMigrationCsv')
+        .addItem('3️⃣ kintoneアプリBへ一括POST＋年度別台帳反映', 'sendPastDataToKintoneAppB')
+    )
+    .addSubMenu(
+      ui
         .createMenu('⚙️ 初期設定・メンテナンス')
         .addItem('📋 3タブ初期構築・フォーマット整備', 'setupAllSheets')
         .addItem('⏰ 未返書リマインド定期トリガー設定（毎週月・木 9:00）', 'setupReminderScheduleTrigger')
@@ -149,7 +156,7 @@ function normalizePhaseValue(rawPhase) {
 }
 
 /**
- * 受入・送出形態を「外来」または「入院」に正規化する
+ * 受入・送出形態を「外来」「入院」「検査」に正規化する
  * @param {string} rawType
  * @return {string}
  */
@@ -158,7 +165,36 @@ function normalizeVisitTypeValue(rawType) {
   if (s.includes('入院')) {
     return SANTE_CONFIG.VISIT_TYPES.INPATIENT;
   }
+  if (s.includes('検査') && SANTE_CONFIG.VISIT_TYPES.EXAM) {
+    return SANTE_CONFIG.VISIT_TYPES.EXAM;
+  }
   return SANTE_CONFIG.VISIT_TYPES.OUTPATIENT;
+}
+
+/**
+ * 連携フェーズと備考・連絡事項から、新規登録時の初期「返書ステータス」を決定する
+ * - 前方（紹介・受入）かつ備考が /(返書不要|書かない|返書なし|記載不要)/ にマッチ: 返書不要（医師判断）
+ * - 前方（紹介・受入）で上記以外: 未作成
+ * - それ以外（後方など）: 対象外
+ *
+ * @param {string} phase
+ * @param {string=} remarks
+ * @return {string}
+ */
+function decideInitialReplyStatus(phase, remarks) {
+  const phaseStr = String(phase || '').trim();
+  const isForward =
+    phaseStr === SANTE_CONFIG.PHASES.FORWARD || phaseStr.startsWith('前方');
+  if (!isForward) {
+    return SANTE_CONFIG.REPLY_STATUS.NOT_APPLICABLE;
+  }
+
+  const remarksStr = String(remarks || '').trim();
+  if (/(返書不要|書かない|返書なし|記載不要)/.test(remarksStr)) {
+    return SANTE_CONFIG.REPLY_STATUS.NOT_REQUIRED;
+  }
+
+  return SANTE_CONFIG.REPLY_STATUS.UNCREATED;
 }
 
 /**
@@ -329,11 +365,15 @@ function applyInputColumnValidations(inputSheet, startCol, numCols) {
   inputSheet.getRange(rows.PHASE, startCol, 1, numCols).setDataValidation(phaseRule);
 
   // 9行目: 受入・送出形態 プルダウン
+  const visitTypeOptions = [
+    SANTE_CONFIG.VISIT_TYPES.OUTPATIENT,
+    SANTE_CONFIG.VISIT_TYPES.INPATIENT,
+  ];
+  if (SANTE_CONFIG.VISIT_TYPES.EXAM) {
+    visitTypeOptions.push(SANTE_CONFIG.VISIT_TYPES.EXAM);
+  }
   const visitTypeRule = SpreadsheetApp.newDataValidation()
-    .requireValueInList(
-      [SANTE_CONFIG.VISIT_TYPES.OUTPATIENT, SANTE_CONFIG.VISIT_TYPES.INPATIENT],
-      true
-    )
+    .requireValueInList(visitTypeOptions, true)
     .setAllowInvalid(true)
     .build();
   inputSheet.getRange(rows.VISIT_TYPE, startCol, 1, numCols).setDataValidation(visitTypeRule);
@@ -612,6 +652,7 @@ function executeBatchProcess() {
   let kintonePosted = 0;
   let kintonePutUpdated = 0;
   let ledgerUpdated = 0;
+  const syncedColNumbersSet = new Set();
 
   try {
     // =========================================================================
@@ -673,10 +714,19 @@ function executeBatchProcess() {
           }
         }
 
-        const isForward = colData.phase === SANTE_CONFIG.PHASES.FORWARD;
-        const replyStatus = isForward
-          ? SANTE_CONFIG.REPLY_STATUS.UNCREATED
-          : SANTE_CONFIG.REPLY_STATUS.NOT_APPLICABLE;
+        const replyStatus = decideInitialReplyStatus(colData.phase, colData.remarks);
+        const normalizedOur = normalizeOurDeptAndDoctor(
+          colData.ourDept,
+          colData.ourDoctor,
+          '',
+          colData.remarks
+        );
+        let mergedRemarks = String(colData.remarks || '').trim();
+        if (normalizedOur.extraNote && !mergedRemarks.includes(normalizedOur.extraNote)) {
+          mergedRemarks = mergedRemarks
+            ? `${mergedRemarks} / ${normalizedOur.extraNote}`
+            : normalizedOur.extraNote;
+        }
 
         let faxStatus = SANTE_CONFIG.FAX_STATUS.NOT_REQUIRED;
         if (colData.faxSent) {
@@ -687,6 +737,7 @@ function executeBatchProcess() {
 
         return {
           _colData: colData,
+          _matchType: resolved.matchType,
           registeredAt: nowStr,
           visitDate: colData.visitDate,
           patientId: colData.patientId,
@@ -697,13 +748,13 @@ function executeBatchProcess() {
           facilityName: officialFacilityName,
           facilityDept: colData.facilityDept,
           facilityDoctor: colData.facilityDoctor,
-          ourDept: colData.ourDept,
-          ourDoctor: colData.ourDoctor,
+          ourDept: normalizedOur.dept,
+          ourDoctor: normalizedOur.doctor,
           replyStatus: replyStatus,
           replyDate: '',
           firstReportUrl: colData.reportDocUrl,
           faxStatus: faxStatus,
-          remarks: colData.remarks,
+          remarks: mergedRemarks,
         };
       });
 
@@ -720,7 +771,7 @@ function executeBatchProcess() {
       appendRecordsToLedger(ledgerRowsToAppend, ss);
       kintonePosted = ledgerRowsToAppend.length;
 
-      // 入力シートのステータスを「✅ kintone反映済」に更新
+      // 入力シートのステータスを「✅ kintone反映済」に更新（部分一致保留以外の列は自動クリア対象に追加）
       postRecordsPayload.forEach((item, idx) => {
         const colNum = item._colData.colNumber;
         const recId = issuedIds[idx] || '';
@@ -732,6 +783,9 @@ function executeBatchProcess() {
           .getRange(rows.VISIT_DATE, colNum)
           .setNote(`kintone登録済: レコードID #${recId} (${nowStr})`);
         item._colData.syncStatus = SANTE_CONFIG.COLUMN_SYNC_STATUS.SYNCED;
+        if (item._matchType !== 'partial') {
+          syncedColNumbersSet.add(colNum);
+        }
       });
     }
 
@@ -793,11 +847,26 @@ function executeBatchProcess() {
           .getRange(statusRow, colNum)
           .setValue(SANTE_CONFIG.COLUMN_SYNC_STATUS.SYNCED)
           .setBackground('#d9ead3');
+
+        const resolvedFacility = resolveFacility(item.colData.facilityName, facilityMasterList);
+        if (resolvedFacility.matchType !== 'partial') {
+          syncedColNumbersSet.add(colNum);
+        }
       });
     }
 
+    // Step 4: 今回の一括実行でkintone連携・台帳反映が成功した列（および C2:C3）を自動クリア
+    let autoClearedCount = 0;
+    if (syncedColNumbersSet.size > 0) {
+      const clearRes = clearSyncedInputColumnsAfterBatch(
+        inputSheet,
+        Array.from(syncedColNumbersSet)
+      );
+      autoClearedCount = clearRes.clearedCount;
+    }
+
     // 完了通知（トースト ＆ Slack通知）
-    const summaryMsg = `第一報生成: ${docsGenerated}件 / kintone新規POST: ${kintonePosted}件 / 返書消込PUT: ${kintonePutUpdated}件 (台帳消込: ${ledgerUpdated}件)`;
+    const summaryMsg = `第一報生成: ${docsGenerated}件 / kintone新規POST: ${kintonePosted}件 / 返書消込PUT: ${kintonePutUpdated}件 (台帳消込: ${ledgerUpdated}件)。生成した第一報URLや登録内容は年度別連携台帳タブに記録され、入力シートの完了列をクリアしました（${autoClearedCount}列）。`;
     ss.toast(summaryMsg, '🎉 SANTE-BRIDGE 一括処理完了', 8);
 
     if (docsGenerated > 0 || kintonePosted > 0 || kintonePutUpdated > 0) {
@@ -814,6 +883,7 @@ function executeBatchProcess() {
       kintonePosted,
       kintonePutUpdated,
       ledgerUpdated,
+      autoClearedCount,
     };
   } catch (err) {
     notifySlackError(
@@ -921,6 +991,57 @@ function reRunFiveLockMatchingForAllColumns() {
   });
 
   ss.toast(`全列の再照合が完了しました（ヒット: ${matchedCount}件）`, '🔍 5重ロック再照合完了', 6);
+}
+
+/**
+ * 一括実行（executeBatchProcess）で kintone 送信および年度別連携台帳への反映が成功した列について、
+ * 4行目ステータス、5〜19行目の値・背景色・セルNote、および C2:C3 貼付セルを自動クリアし、
+ * 15行目・17行目のチェックボックスを false にリセットする
+ * （エラー列・未処理列・施設名部分一致保留列はそのまま残す）
+ *
+ * @param {GoogleAppsScript.Spreadsheet.Sheet=} inputSheet
+ * @param {Array<number>} syncedColNumbers 今回同期に成功した1-based列番号配列
+ * @return {{clearedCount: number, clearedColumns: Array<number>, pasteRangeCleared: boolean}}
+ */
+function clearSyncedInputColumnsAfterBatch(inputSheet, syncedColNumbers) {
+  const sheet =
+    inputSheet ||
+    SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SANTE_CONFIG.SHEETS.INPUT);
+  if (!sheet) {
+    return { clearedCount: 0, clearedColumns: [], pasteRangeCleared: false };
+  }
+
+  const pasteRange = sheet.getRange(SANTE_CONFIG.INPUT_LAYOUT.PASTE_RANGE);
+  pasteRange.clearContent();
+
+  const uniqueCols = Array.from(
+    new Set((syncedColNumbers || []).map((n) => Number(n)).filter((n) => n >= 3))
+  );
+  if (uniqueCols.length === 0) {
+    return { clearedCount: 0, clearedColumns: [], pasteRangeCleared: true };
+  }
+
+  const statusRow = SANTE_CONFIG.INPUT_LAYOUT.STATUS_ROW;
+  const rowEnd = SANTE_CONFIG.INPUT_LAYOUT.ROW_END;
+  const totalRows = rowEnd - statusRow + 1; // 4〜19行目 (16行)
+  const rows = SANTE_CONFIG.INPUT_LAYOUT.ROWS;
+
+  uniqueCols.forEach((colNum) => {
+    const colRange = sheet.getRange(statusRow, colNum, totalRows, 1);
+    colRange.clearContent();
+    colRange.setBackground(null);
+    colRange.clearNote();
+
+    // 15行目・17行目のチェックボックスを false へ戻す
+    sheet.getRange(rows.NEED_FIRST_REPORT, colNum).setValue(false);
+    sheet.getRange(rows.FAX_SENT, colNum).setValue(false);
+  });
+
+  return {
+    clearedCount: uniqueCols.length,
+    clearedColumns: uniqueCols,
+    pasteRangeCleared: true,
+  };
 }
 
 /**
