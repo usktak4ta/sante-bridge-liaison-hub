@@ -20,6 +20,7 @@ const PAST_MIGRATION_HEADERS = Object.freeze([
   '返書日',
   '返書ステータス',
   '備考・連絡事項',
+  '移行済レコードID',
 ]);
 
 /**
@@ -115,7 +116,45 @@ function classifyPastRecordReplyStatus(rawReplyDate, rawDoneFlag, rawInquiry, ra
 }
 
 /**
- * 過去月別タブの1行（0始まり row[0]〜row[13]）を移行シート用の16列データへ変換する純粋関数
+ * 過去データのM列（row[12] 問い合わせ）に除外キーワード（報告 → 照会 → 教示）が含まれるか判定する
+ * ※ 先に当たった1理由のみを返し、同じ行を二重カウントしない。「逆紹介」は「報告」を含まないため除外されない。
+ *
+ * @param {string} rawInquiry
+ * @return {'報告'|'照会'|'教示'|''} スキップ理由（除外対象外の場合は ''）
+ */
+function detectPastRowSkipReason(rawInquiry) {
+  const inquiry = String(rawInquiry || '').trim();
+  if (!inquiry) return '';
+  if (inquiry.includes('報告')) return '報告';
+  if (inquiry.includes('照会')) return '照会';
+  if (inquiry.includes('教示')) return '教示';
+  return '';
+}
+
+/**
+ * 移行シート（【kintone一括登録用】紹介・逆紹介）の17列目に「移行済レコードID」ヘッダが存在することを保証する
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet
+ * @return {number} 移行済レコードID列の1-based列番号（17）
+ */
+function ensureMigratedRecordIdColumn(sheet) {
+  const migratedIdColNum = PAST_MIGRATION_HEADERS.length; // 17
+  if (!sheet) return migratedIdColNum;
+  const migratedIdHeader = PAST_MIGRATION_HEADERS[migratedIdColNum - 1];
+  const currentHeader = String(sheet.getRange(1, migratedIdColNum).getValue() || '').trim();
+  if (currentHeader !== migratedIdHeader) {
+    sheet
+      .getRange(1, migratedIdColNum)
+      .setValue(migratedIdHeader)
+      .setBackground('#0F4C5C')
+      .setFontColor('#FFFFFF')
+      .setFontWeight('bold')
+      .setHorizontalAlignment('center');
+  }
+  return migratedIdColNum;
+}
+
+/**
+ * 過去月別タブの1行（0始まり row[0]〜row[13]）を移行シート用の17列データへ変換する純粋関数
  * @param {Array<*>} row
  * @param {Array<Object>} facilityMasterList
  * @return {{
@@ -136,6 +175,12 @@ function transformPastSheetRow(row, facilityMasterList) {
   const patientId = String(row[1] !== undefined && row[1] !== null ? row[1] : '').trim();
   const patientName = String(row[2] !== undefined && row[2] !== null ? row[2] : '').trim();
   if (!patientId && !patientName) {
+    return null;
+  }
+
+  // row[12]: 問い合わせに「報告」「照会」「教示」が含まれる行は classifyPastRecordReplyStatus より前に除外
+  const rawInquiry = String(row[12] || '').trim();
+  if (detectPastRowSkipReason(rawInquiry)) {
     return null;
   }
 
@@ -164,7 +209,6 @@ function transformPastSheetRow(row, facilityMasterList) {
   const visitType = normalizeVisitTypeValue(row[6]);
 
   // row[7], row[8]: 当院診療科・医師（現役11名・9診療科正規化）
-  const rawInquiry = String(row[12] || '').trim();
   const rawRemarks = String(row[13] || '').trim();
   const ourNormalized = normalizeOurDeptAndDoctor(row[7], row[8], rawInquiry, rawRemarks);
 
@@ -200,6 +244,7 @@ function transformPastSheetRow(row, facilityMasterList) {
     statusInfo.replyDate,   // 13: 返書日
     statusInfo.replyStatus, // 14: 返書ステータス
     combinedRemarks,        // 15: 備考・連絡事項
+    '',                     // 16: 移行済レコードID
   ];
 
   return {
@@ -218,6 +263,8 @@ function transformPastSheetRow(row, facilityMasterList) {
  * @return {{
  *   totalCount: number,
  *   countsByStatus: Object<string, number>,
+ *   skippedByReason: Object<string, number>,
+ *   skippedCount: number,
  *   processedSheets: Array<string>
  * }}
  */
@@ -233,6 +280,11 @@ function buildPastDataMigrationSheet(ss) {
     [SANTE_CONFIG.REPLY_STATUS.NOT_REQUIRED]: 0,
     [SANTE_CONFIG.REPLY_STATUS.UNCREATED]: 0,
     [SANTE_CONFIG.REPLY_STATUS.NOT_APPLICABLE]: 0,
+  };
+  const skippedByReason = {
+    報告: 0,
+    照会: 0,
+    教示: 0,
   };
 
   allSheets.forEach((sheet) => {
@@ -268,7 +320,26 @@ function buildPastDataMigrationSheet(ss) {
     processedSheets.push(sheetName);
 
     for (let r = headerRowIdx + 1; r < values.length; r++) {
-      const transformed = transformPastSheetRow(values[r], facilityMasterList);
+      const row = values[r];
+      if (!row || !Array.isArray(row)) continue;
+      const visitDate = formatDateYMD(row[0]);
+      if (!visitDate || visitDate === '来院日' || !/^\d{4}-\d{2}-\d{2}$/.test(visitDate)) {
+        continue;
+      }
+      const patientId = String(row[1] !== undefined && row[1] !== null ? row[1] : '').trim();
+      const patientName = String(row[2] !== undefined && row[2] !== null ? row[2] : '').trim();
+      if (!patientId && !patientName) {
+        continue;
+      }
+
+      // M列（row[12] 問い合わせ）の除外判定（報告 → 照会 → 教示 の順で先に当たった1理由のみカウント）
+      const skipReason = detectPastRowSkipReason(row[12]);
+      if (skipReason) {
+        skippedByReason[skipReason]++;
+        continue;
+      }
+
+      const transformed = transformPastSheetRow(row, facilityMasterList);
       if (!transformed) continue;
 
       outputRows.push(transformed.rowArray);
@@ -301,9 +372,10 @@ function buildPastDataMigrationSheet(ss) {
   outSheet.setFrozenRows(1);
 
   if (outputRows.length > 0) {
-    // 患者ID列（2列目）と受診日列（1列目）・返書日列（14列目）を文字列書式に維持
+    // 患者ID列（2列目）と受診日列（1列目）・返書日列（14列目）・移行済レコードID列（17列目）を文字列書式に維持
     outSheet.getRange(2, 1, outputRows.length, 2).setNumberFormat('@');
     outSheet.getRange(2, 14, outputRows.length, 1).setNumberFormat('@');
+    outSheet.getRange(2, PAST_MIGRATION_HEADERS.length, outputRows.length, 1).setNumberFormat('@');
     outSheet
       .getRange(2, 1, outputRows.length, PAST_MIGRATION_HEADERS.length)
       .setValues(outputRows);
@@ -316,6 +388,9 @@ function buildPastDataMigrationSheet(ss) {
     `・返書不要（医師判断）: ${countsByStatus[SANTE_CONFIG.REPLY_STATUS.NOT_REQUIRED]}件`,
     `・未作成: ${countsByStatus[SANTE_CONFIG.REPLY_STATUS.UNCREATED]}件`,
     `・対象外（逆紹介等）: ${countsByStatus[SANTE_CONFIG.REPLY_STATUS.NOT_APPLICABLE]}件`,
+    `・スキップ（報告）: ${skippedByReason['報告']}件`,
+    `・スキップ（照会）: ${skippedByReason['照会']}件`,
+    `・スキップ（教示）: ${skippedByReason['教示']}件`,
   ].join('\n');
 
   try {
@@ -335,6 +410,9 @@ function buildPastDataMigrationSheet(ss) {
   return {
     totalCount: outputRows.length,
     countsByStatus: countsByStatus,
+    skippedByReason: skippedByReason,
+    skippedCount:
+      skippedByReason['報告'] + skippedByReason['照会'] + skippedByReason['教示'],
     processedSheets: processedSheets,
   };
 }
@@ -382,6 +460,8 @@ function downloadMigrationCsv(ss) {
     );
   }
 
+  ensureMigratedRecordIdColumn(sheet);
+
   const lastRow = sheet.getLastRow();
   const matrix = sheet
     .getRange(1, 1, lastRow, PAST_MIGRATION_HEADERS.length)
@@ -418,10 +498,11 @@ function downloadMigrationCsv(ss) {
 /**
  * 【タスク4-3】『【kintone一括登録用】紹介・逆紹介』のデータを読み取り、
  * ルックアップ自動コピー先の「連携先施設名_0」や空の日付・空のドロップダウン項目を除外した上で、
- * 100件単位で kintone アプリBへ一括 POST し、発番された ids とともに年度別連携台帳へも同時反映する
+ * 100件単位で kintone アプリBへ一括 POST し、発番された ids を「移行済レコードID」列へ記録するとともに年度別連携台帳へも同時反映する
+ * （既に「移行済レコードID」列に値がある行はスキップし、二重登録を防止する）
  *
  * @param {GoogleAppsScript.Spreadsheet.Spreadsheet=} ss
- * @return {{postedCount: number, ledgerAppendedCount: number, ids: Array<string>}}
+ * @return {{postedCount: number, ledgerAppendedCount: number, skippedCount: number, ids: Array<string>}}
  */
 function sendPastDataToKintoneAppB(ss) {
   const spreadsheet = ss || SpreadsheetApp.getActiveSpreadsheet();
@@ -436,6 +517,9 @@ function sendPastDataToKintoneAppB(ss) {
     );
   }
 
+  const migratedIdColNum = ensureMigratedRecordIdColumn(sheet);
+  const migratedIdColIdx = migratedIdColNum - 1; // 16
+
   const lastRow = sheet.getLastRow();
   const rows = sheet
     .getRange(2, 1, lastRow - 1, PAST_MIGRATION_HEADERS.length)
@@ -443,12 +527,21 @@ function sendPastDataToKintoneAppB(ss) {
 
   const nowStr = formatDateTimeNow();
   const migrationRecords = [];
+  let skippedCount = 0;
 
-  rows.forEach((row) => {
+  rows.forEach((row, rowIdx) => {
+    const sheetRowNumber = rowIdx + 2;
     const visitDate = formatDateYMD(row[0]);
     const patientId = String(row[1] || '').trim();
     const patientName = String(row[2] || '').trim();
     if (!visitDate && !patientId && !patientName) return;
+
+    // 既に「移行済レコードID」が記録されている行は POST・台帳追記ともにスキップ
+    const existingMigratedId = String(row[migratedIdColIdx] || '').trim();
+    if (existingMigratedId !== '') {
+      skippedCount++;
+      return;
+    }
 
     const phaseVal = String(row[4] || row[3] || SANTE_CONFIG.PHASES.FORWARD).trim();
     const visitTypeVal = String(row[5] || '').trim();
@@ -464,6 +557,7 @@ function sendPastDataToKintoneAppB(ss) {
     const remarksVal = String(row[15] || '').trim();
 
     migrationRecords.push({
+      _sheetRowNumber: sheetRowNumber,
       registeredAt: nowStr,
       visitDate: visitDate,
       patientId: patientId,
@@ -488,45 +582,65 @@ function sendPastDataToKintoneAppB(ss) {
   });
 
   if (migrationRecords.length === 0) {
-    return { postedCount: 0, ledgerAppendedCount: 0, ids: [] };
+    const skipMsg = `新規移行対象は 0件 です（移行済スキップ: ${skippedCount}件）。`;
+    spreadsheet.toast(skipMsg, 'ℹ️ 過去データ一括移行', 8);
+    return {
+      postedCount: 0,
+      ledgerAppendedCount: 0,
+      skippedCount: skippedCount,
+      ids: [],
+    };
   }
 
+  let postedCount = 0;
+  let ledgerAppendedCount = 0;
+  const allIssuedIds = [];
+
   try {
-    // 1. 既存の postRecordsToKintoneBatch（100件分割・Auto-Recovery付）で kintone アプリBへ一括登録
-    const postResult = postRecordsToKintoneBatch(migrationRecords);
-    const issuedIds = postResult.ids || [];
+    // 100件チャンク成功ごとに移行シートの「移行済レコードID」列への書き込みと年度別台帳追記を確定する
+    postRecordsToKintoneBatch(migrationRecords, {
+      onChunkSuccess: (chunk, chunkIds) => {
+        chunk.forEach((rec, idx) => {
+          const recId = chunkIds[idx] || '';
+          sheet.getRange(rec._sheetRowNumber, migratedIdColNum).setValue(recId);
+        });
 
-    // 2. 返却されたレコードIDを付与して年度別連携台帳へ一括追記（5重ロック・リマインド連動）
-    const ledgerRecords = migrationRecords.map((rec, idx) => ({
-      kintoneRecordId: issuedIds[idx] || '',
-      registeredAt: rec.registeredAt,
-      visitDate: rec.visitDate,
-      patientId: rec.patientId,
-      patientName: rec.patientName,
-      phase: rec.phase,
-      visitType: rec.visitType,
-      lookupKey: rec.lookupKey,
-      facilityName: rec._ledgerFacilityName,
-      facilityDept: rec.facilityDept,
-      facilityDoctor: rec.facilityDoctor,
-      ourDept: rec.ourDept,
-      ourDoctor: rec.ourDoctor,
-      replyStatus: rec.replyStatus,
-      replyDate: rec.replyDate,
-      firstReportUrl: '',
-      faxStatus: SANTE_CONFIG.FAX_STATUS.NOT_REQUIRED,
-      remarks: rec.remarks,
-    }));
+        const chunkLedgerRecords = chunk.map((rec, idx) => ({
+          kintoneRecordId: chunkIds[idx] || '',
+          registeredAt: rec.registeredAt,
+          visitDate: rec.visitDate,
+          patientId: rec.patientId,
+          patientName: rec.patientName,
+          phase: rec.phase,
+          visitType: rec.visitType,
+          lookupKey: rec.lookupKey,
+          facilityName: rec._ledgerFacilityName,
+          facilityDept: rec.facilityDept,
+          facilityDoctor: rec.facilityDoctor,
+          ourDept: rec.ourDept,
+          ourDoctor: rec.ourDoctor,
+          replyStatus: rec.replyStatus,
+          replyDate: rec.replyDate,
+          firstReportUrl: '',
+          faxStatus: SANTE_CONFIG.FAX_STATUS.NOT_REQUIRED,
+          remarks: rec.remarks,
+        }));
 
-    const appendedMeta = appendRecordsToLedger(ledgerRecords, spreadsheet);
+        const appendedMeta = appendRecordsToLedger(chunkLedgerRecords, spreadsheet);
+        postedCount += chunk.length;
+        ledgerAppendedCount += appendedMeta.length;
+        chunkIds.forEach((id) => allIssuedIds.push(id));
+      },
+    });
 
-    const doneMsg = `過去データ ${migrationRecords.length}件 を kintone アプリBへ一括登録し、年度別連携台帳へ ${appendedMeta.length}件 反映しました。`;
+    const doneMsg = `過去データ ${postedCount}件 を kintone アプリBへ一括登録し、年度別連携台帳へ ${ledgerAppendedCount}件 反映しました（移行済スキップ: ${skippedCount}件）。`;
     spreadsheet.toast(doneMsg, '🎉 過去データ一括移行完了', 8);
 
     return {
-      postedCount: migrationRecords.length,
-      ledgerAppendedCount: appendedMeta.length,
-      ids: issuedIds,
+      postedCount: postedCount,
+      ledgerAppendedCount: ledgerAppendedCount,
+      skippedCount: skippedCount,
+      ids: allIssuedIds,
     };
   } catch (err) {
     notifySlackError(
@@ -534,6 +648,8 @@ function sendPastDataToKintoneAppB(ss) {
       err,
       {
         targetRecordCount: String(migrationRecords.length),
+        completedBeforeErrorCount: String(postedCount),
+        skippedCount: String(skippedCount),
       },
       { includeStack: false }
     );
