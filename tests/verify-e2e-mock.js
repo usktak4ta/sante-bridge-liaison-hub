@@ -184,8 +184,16 @@ class MockRange {
   setFontSize() {
     return this;
   }
-  setBackground() {
+  setBackground(bg) {
+    for (let r = 0; r < this.numRows; r++) {
+      for (let c = 0; c < this.numCols; c++) {
+        this.sheet._getCell(this.row + r, this.col + c).background = bg ? String(bg) : '';
+      }
+    }
     return this;
+  }
+  getBackground() {
+    return this.sheet._getCell(this.row, this.col).background || '';
   }
 }
 
@@ -503,6 +511,43 @@ const sandbox = {
       };
     },
     getActiveSpreadsheet: () => state.activeSpreadsheet,
+    getUi: () => ({
+      ButtonSet: { OK: 'OK', YES_NO: 'YES_NO' },
+      Button: { OK: 'OK', YES: 'YES', NO: 'NO' },
+      alert: (title, prompt, buttonSet) => {
+        if (!state.uiAlerts) state.uiAlerts = [];
+        state.uiAlerts.push({
+          title: String(title || ''),
+          prompt: String(prompt || ''),
+          buttonSet: String(buttonSet || ''),
+        });
+        return state.uiAlertResponse || 'NO';
+      },
+      showModalDialog: (htmlOutput, title) => {
+        if (!state.uiDialogs) state.uiDialogs = [];
+        state.uiDialogs.push({ title: String(title || '') });
+      },
+      createMenu: (menuTitle) => {
+        if (!state.menuItems) state.menuItems = [];
+        const menuObj = {
+          title: menuTitle,
+          addItem(label, fnName) {
+            state.menuItems.push({ menu: menuTitle, label, fnName });
+            return this;
+          },
+          addSeparator() {
+            return this;
+          },
+          addSubMenu() {
+            return this;
+          },
+          addToUi() {
+            return this;
+          },
+        };
+        return menuObj;
+      },
+    }),
   },
 };
 
@@ -2062,6 +2107,464 @@ function recordPass(category, description) {
   recordPass(
     'タスクF 移行済レコードIDによる再実行防止・途中失敗保護',
     'sendPastDataToKintoneAppB で移行済レコードID列への記録・再実行スキップ・100件チャンク途中失敗時の成功分ID保持が正常に動作すること'
+  );
+}
+
+// ============================================================================
+// 7. 移行シート／入力シートのリセット・setupAllSheets既存列6択更新・空の受診日の保留 (タスク1〜4)
+// ============================================================================
+{
+  // メニュー定義（onOpen）の文言確認
+  state.menuItems = [];
+  sandbox.onOpen();
+  assert(
+    state.menuItems.some(
+      (m) =>
+        m.menu === '🛠️ 返書管理・過去データ移行' &&
+        m.label === '4️⃣ 移行用シートのリセット（登録済み確認後）' &&
+        m.fnName === 'resetPastDataMigrationSheet'
+    ),
+    'onOpen のサブメニュー「🛠️ 返書管理・過去データ移行」に「4️⃣ 移行用シートのリセット（登録済み確認後）」が追加されていること'
+  );
+  assert(
+    state.menuItems.some(
+      (m) =>
+        m.menu === '🏥 SANTE-BRIDGE 連携メニュー' &&
+        m.label === '🔄 入力シートの全リセット（未処理列も消去）' &&
+        m.fnName === 'resetInputSheetAllColumns'
+    ),
+    'onOpen に「🔄 入力シートの全リセット（未処理列も消去）」が追加されていること'
+  );
+  assert(
+    state.menuItems.some(
+      (m) =>
+        m.menu === '⚙️ 初期設定・メンテナンス' &&
+        m.label === '📋 3タブ初期構築・フォーマット整備' &&
+        m.fnName === 'setupAllSheets'
+    ),
+    'onOpen の「📋 3タブ初期構築・フォーマット整備」の表示名が変更されていないこと'
+  );
+
+  // [タスク1-1] 移行③ (sendPastDataToKintoneAppB) のあと:
+  // 全行に移行済レコードIDがあり台帳追記成功なら YES でデータ行だけ消えヘッダが残る / NO なら残る / 未送信行があるときは自動では消えない
+  state.activeSpreadsheet = new MockSpreadsheet();
+  sandbox.setupAllSheets();
+  const pastSheetT1 = state.activeSpreadsheet.insertSheet('2026年6月');
+  pastSheetT1.getRange(1, 1, 3, 14).setValues([
+    [
+      '来院日',
+      '患者ID',
+      '患者氏名',
+      '紹介元病院名',
+      '紹介元診療科',
+      '紹介元医師名',
+      '受入・送出形態',
+      '当院診療科',
+      '担当医師',
+      '返書日',
+      '済/未',
+      '予備',
+      '問い合わせ',
+      '備考',
+    ],
+    ['2026-06-01', '40001', '山田太郎', '○○中央病院', '内科', '佐藤一郎', '外来', '内科', '大江健介', '2026-06-05', '済', '', '', ''],
+    ['2026-06-02', '40002', '鈴木花子', '○○中央病院', '内科', '佐藤一郎', '外来', '内科', '大江健介', '', '未', '', '', ''],
+  ]);
+  sandbox.buildPastDataMigrationSheet(state.activeSpreadsheet);
+  const migSheetT1 = state.activeSpreadsheet.getSheetByName('【kintone一括登録用】紹介・逆紹介');
+
+  // (a) NO を選んだ場合: データ行が消えずに残ること
+  state.uiAlerts = [];
+  state.uiAlertResponse = 'NO';
+  const postResNo = sandbox.sendPastDataToKintoneAppB(state.activeSpreadsheet);
+  assert.strictEqual(postResNo.postedCount, 2);
+  assert.strictEqual(postResNo.clearedAfterPost, false, 'NO選択時は clearedAfterPost が false であること');
+  assert.strictEqual(migSheetT1.getLastRow(), 3, 'NO選択時はデータ行（2行目・3行目）がそのまま残ること');
+  assert(
+    state.uiAlerts.some(
+      (a) =>
+        a.buttonSet === 'YES_NO' &&
+        a.prompt.includes('kintone登録が完了しました。【kintone一括登録用】紹介・逆紹介 シートの展開データをクリアしますか？')
+    ),
+    '全行登録完了時に YES_NO のクリア確認ダイアログが表示されること'
+  );
+
+  // (b) YES を選んだ場合: データ行だけ消え、1行目ヘッダと文字列書式（@）が残り、シート自体は削除されないこと
+  sandbox.buildPastDataMigrationSheet(state.activeSpreadsheet);
+  state.uiAlerts = [];
+  state.uiAlertResponse = 'YES';
+  const postResYes = sandbox.sendPastDataToKintoneAppB(state.activeSpreadsheet);
+  assert.strictEqual(postResYes.postedCount, 2);
+  assert.strictEqual(postResYes.clearedAfterPost, true, 'YES選択時は clearedAfterPost が true であること');
+  assert.strictEqual(migSheetT1.getLastRow(), 1, 'YES選択時はデータ行がクリアされ1行目ヘッダのみ残ること');
+  assert.strictEqual(migSheetT1.getRange(1, 1).getValue(), '受診日', '1行目ヘッダが消えずに残ること');
+  assert.strictEqual(migSheetT1.getRange(1, 17).getValue(), '移行済レコードID', '17列目ヘッダが消えずに残ること');
+  assert.strictEqual(migSheetT1.getRange(2, 1).getNumberFormat(), '@', '1列目の文字列書式 @ が維持されること');
+  assert.strictEqual(migSheetT1.getRange(2, 2).getNumberFormat(), '@', '2列目の文字列書式 @ が維持されること');
+  assert.strictEqual(migSheetT1.getRange(2, 17).getNumberFormat(), '@', '17列目の文字列書式 @ が維持されること');
+  assert(
+    state.activeSpreadsheet.getSheetByName('【kintone一括登録用】紹介・逆紹介') !== null,
+    'シート自体は削除されないこと'
+  );
+
+  // (c) 未送信行が1行でも残っている場合: YES_NO ダイアログを出さず、絶対に消さないこと
+  sandbox.buildPastDataMigrationSheet(state.activeSpreadsheet);
+  // 3行目の受診日を空にして未送信行にする
+  migSheetT1.getRange(3, 1).setValue('');
+  state.uiAlerts = [];
+  state.uiAlertResponse = 'YES';
+  const postResPartial = sandbox.sendPastDataToKintoneAppB(state.activeSpreadsheet);
+  assert.strictEqual(postResPartial.postedCount, 1, '有効な1行目のみPOSTされること');
+  assert.strictEqual(postResPartial.unmigratedCount, 1, '未送信行が1件として検出されること');
+  assert.strictEqual(postResPartial.clearedAfterPost, false, '未送信行があるときは自動クリアされないこと');
+  assert.strictEqual(
+    state.uiAlerts.filter((a) => a.buttonSet === 'YES_NO').length,
+    0,
+    '未送信行があるときはクリア確認ダイアログを出さないこと'
+  );
+  assert.strictEqual(migSheetT1.getRange(3, 2).getValue(), '40002', '未送信のデータ行が消えずに残ること');
+
+  // [タスク1-2] メニュー④ (resetPastDataMigrationSheet):
+  // 未送信があれば拒否して件数を返し強制クリアできない / 全行登録済みならクリア（ヘッダと書式保持）
+  state.uiAlerts = [];
+  state.uiAlertResponse = 'YES';
+  const menu4Refuse = sandbox.resetPastDataMigrationSheet(state.activeSpreadsheet);
+  assert.strictEqual(menu4Refuse.cleared, false, '未送信行があるときはメニュー④でも拒否されること');
+  assert.strictEqual(menu4Refuse.unmigratedCount, 1, '未送信件数（1件）が返されること');
+  assert.strictEqual(migSheetT1.getRange(3, 2).getValue(), '40002', '強制クリアされずデータが残ること');
+
+  // 3行目にも移行済レコードIDが入って全行登録済みになった状態で NO -> YES を検証
+  migSheetT1.getRange(3, 1).setValue('2026-06-02');
+  migSheetT1.getRange(3, 17).setValue('9099');
+  state.httpRequests.length = 0;
+
+  state.uiAlertResponse = 'NO';
+  const menu4No = sandbox.resetPastDataMigrationSheet(state.activeSpreadsheet);
+  assert.strictEqual(menu4No.cleared, false, 'メニュー④の確認ダイアログでNOを選ぶとクリアされないこと');
+  assert.strictEqual(migSheetT1.getLastRow(), 3, 'NO選択時はデータ行が残ること');
+
+  state.uiAlertResponse = 'YES';
+  const menu4Yes = sandbox.resetPastDataMigrationSheet(state.activeSpreadsheet);
+  assert.strictEqual(menu4Yes.cleared, true, '全行登録済みでYESを選ぶとメニュー④でクリアされること');
+  assert.strictEqual(menu4Yes.clearedRowCount, 2, 'クリアされたデータ行数が2件であること');
+  assert.strictEqual(migSheetT1.getLastRow(), 1, 'データ行のみ消去され1行目ヘッダが残ること');
+  assert.strictEqual(state.httpRequests.length, 0, 'メニュー④実行時にkintone通信が一切発生しないこと');
+  assert.strictEqual(pastSheetT1.getLastRow(), 3, '月別の元タブには一切触れないこと');
+
+  recordPass(
+    'タスク1 過去データ移行シートのリセット',
+    '移行③完了後およびメニュー④で全対象行に移行済レコードIDがあるときのみデータ行をクリア（ヘッダ・書式保持）し、未送信行があるときは拒否・保護されること'
+  );
+
+  // [タスク2] 入力シートの手動フルリセット (resetInputSheetAllColumns)
+  state.activeSpreadsheet = new MockSpreadsheet();
+  sandbox.setupAllSheets();
+  const masterSheetT2 = state.activeSpreadsheet.getSheetByName('施設マスター');
+  masterSheetT2.getRange(2, 1, 2, 7).setValues([
+    ['TEST-01', '○○中央病院', '東京都千代田区1-1', '03-0000-0001', '', '', ''],
+    ['TEST-02', '△△中央病院', '東京都中央区2-2', '03-0000-0002', '', '', ''],
+  ]);
+  const inputSheetT2 = state.activeSpreadsheet.getSheetByName('紹介・逆紹介入力');
+  const ledgerSheetT2 = state.activeSpreadsheet.getSheetByName(sandbox.getLedgerSheetName());
+  const ledgerRowsBeforeT2 = ledgerSheetT2.getLastRow();
+
+  // 部分一致保留・フェーズ未確定・受診日未確定の3列を展開し、C2にもテキストを置き、8行目を旧4択に模擬変更
+  sandbox.expandJsonAndMatchLedger(
+    JSON.stringify([
+      {
+        受診日: '2026-10-31',
+        患者ID: '50001',
+        患者氏名: '山田太郎',
+        連携フェーズ: '前方（紹介・受入）',
+        受入形態: '入院',
+        連携先施設名: '中央病院', // 部分一致保留
+      },
+      {
+        受診日: '2026-10-31',
+        患者ID: '50002',
+        患者氏名: '鈴木花子',
+        連携フェーズ: '', // フェーズ未確定保留
+        受入形態: '外来',
+        連携先施設名: '○○中央病院',
+      },
+      {
+        受診日: '', // 受診日未確定保留
+        患者ID: '50003',
+        患者氏名: '高橋三郎',
+        連携フェーズ: '前方（紹介・受入）',
+        受入形態: '外来',
+        連携先施設名: '○○中央病院',
+      },
+    ]),
+    state.activeSpreadsheet
+  );
+  inputSheetT2.getRange('C2').setValue('{"dummy":"paste"}');
+  inputSheetT2.getRange(17, 3).setValue(true);
+  const old4PhaseRule = sandbox.SpreadsheetApp.newDataValidation()
+    .requireValueInList(
+      [
+        '前方（紹介・受入）',
+        '後方（逆紹介・送出）',
+        '返書（経過・結果報告）',
+        'その他（介護連携・対診）',
+      ],
+      true
+    )
+    .setAllowInvalid(true)
+    .build();
+  inputSheetT2.getRange(8, 3, 1, 3).setDataValidation(old4PhaseRule);
+
+  // (a) NO を選んだ場合: 何も消えないこと
+  state.httpRequests.length = 0;
+  state.uiAlerts = [];
+  state.uiAlertResponse = 'NO';
+  const resetNoRes = sandbox.resetInputSheetAllColumns(state.activeSpreadsheet);
+  assert.strictEqual(resetNoRes.reset, false, 'NO選択時は reset: false が返ること');
+  assert.strictEqual(resetNoRes.unprocessedColumnCount, 3, '未処理列3件が集計されていること');
+  assert(
+    state.uiAlerts.some(
+      (a) => a.buttonSet === 'YES_NO' && a.prompt.includes('3列')
+    ),
+    '確認ダイアログ本文に消去される未処理列の件数（3列）が含まれること'
+  );
+  assert.strictEqual(inputSheetT2.getRange('C2').getValue(), '{"dummy":"paste"}', 'NO選択時はC2が消えないこと');
+  assert.strictEqual(inputSheetT2.getRange(7, 3).getValue(), '山田太郎', 'NO選択時はデータ列が消えないこと');
+
+  // (b) YES を選んだ場合: C2:C3 と全データ列（未処理列含む）の値・背景色・Noteが消え、15/17行目がfalse、8行目が6択になり、kintone/台帳は呼ばれないこと
+  state.uiAlertResponse = 'YES';
+  const resetYesRes = sandbox.resetInputSheetAllColumns(state.activeSpreadsheet);
+  assert.strictEqual(resetYesRes.reset, true, 'YES選択時は reset: true が返ること');
+  assert.strictEqual(resetYesRes.clearedColumnCount, 3, '3列すべて消去されること');
+  assert.strictEqual(inputSheetT2.getRange('C2').getValue(), '', 'C2がクリアされること');
+  for (let col = 3; col <= 12; col++) {
+    assert.strictEqual(inputSheetT2.getRange(4, col).getValue(), '', `col ${col} の4行目ステータスが空であること`);
+    assert.strictEqual(inputSheetT2.getRange(4, col).getBackground(), '', `col ${col} の4行目背景色がクリアされていること`);
+    assert.strictEqual(inputSheetT2.getRange(7, col).getValue(), '', `col ${col} の7行目患者氏名が空であること`);
+    assert.strictEqual(inputSheetT2.getRange(10, col).getNote(), '', `col ${col} の10行目Noteがクリアされていること`);
+    assert.strictEqual(inputSheetT2.getRange(15, col).getValue(), false, `col ${col} の15行目チェックボックスが false であること`);
+    assert.strictEqual(inputSheetT2.getRange(17, col).getValue(), false, `col ${col} の17行目チェックボックスが false であること`);
+    const vRule = inputSheetT2.getRange(8, col).getDataValidation();
+    assert(vRule && vRule.listValues.length === 6, `col ${col} の8行目プルダウンが6択に更新されていること`);
+  }
+  assert.strictEqual(state.httpRequests.length, 0, 'フルリセット時にkintone通信が一切発生しないこと');
+  assert.strictEqual(ledgerSheetT2.getLastRow(), ledgerRowsBeforeT2, 'フルリセット時に年度別台帳が一切変更されないこと');
+
+  recordPass(
+    'タスク2 入力シートの手動フルリセット',
+    'resetInputSheetAllColumns で確認YES時にC2:C3・未処理列を含む全データ列の値/背景色/Noteを消去し、15・17行目をfalse、8行目を6択に再設定し、NO時は保持されること'
+  );
+
+  // [タスク3] setupAllSheets で既存列の値・Note・チェック状態を消さずに8行目を6択へ更新する
+  state.activeSpreadsheet = new MockSpreadsheet();
+  sandbox.setupAllSheets();
+  const inputSheetT3 = state.activeSpreadsheet.getSheetByName('紹介・逆紹介入力');
+  sandbox.expandJsonAndMatchLedger(
+    JSON.stringify([
+      {
+        受診日: '2026-10-31',
+        患者ID: '60001',
+        患者氏名: '山田太郎',
+        連携フェーズ: '前方（紹介・受入）',
+        受入形態: '入院',
+        連携先施設名: '○○中央病院',
+      },
+      {
+        受診日: '2026-10-31',
+        患者ID: '60002',
+        患者氏名: '鈴木花子',
+        連携フェーズ: '後方（逆紹介・送出）',
+        受入形態: '外来',
+        連携先施設名: '○○中央病院',
+      },
+    ]),
+    state.activeSpreadsheet
+  );
+  inputSheetT3.getRange(10, 3).setNote('既存の大切な確認メモ');
+  inputSheetT3.getRange(17, 3).setValue(true);
+  // 既存列(C列・D列)の8行目をあえて旧4択に戻す
+  inputSheetT3.getRange(8, 3, 1, 2).setDataValidation(old4PhaseRule);
+  assert.strictEqual(inputSheetT3.getRange(8, 3).getDataValidation().listValues.length, 4);
+
+  // setupAllSheets を再実行
+  sandbox.setupAllSheets();
+  assert.strictEqual(inputSheetT3.getRange(7, 3).getValue(), '山田太郎', 'setupAllSheets 実行後もC列の患者氏名が消えないこと');
+  assert.strictEqual(inputSheetT3.getRange(7, 4).getValue(), '鈴木花子', 'setupAllSheets 実行後もD列の患者氏名が消えないこと');
+  assert.strictEqual(inputSheetT3.getRange(10, 3).getNote(), '既存の大切な確認メモ', 'setupAllSheets 実行後も既存Noteが消えないこと');
+  assert.strictEqual(inputSheetT3.getRange(15, 3).getValue(), true, 'setupAllSheets 実行後も15行目のチェック状態(true)が保たれること');
+  assert.strictEqual(inputSheetT3.getRange(17, 3).getValue(), true, 'setupAllSheets 実行後も17行目のチェック状態(true)が保たれること');
+  assert.strictEqual(
+    inputSheetT3.getRange(8, 3).getDataValidation().listValues.length,
+    6,
+    'setupAllSheets 実行後に既存C列の8行目プルダウンが6択へ更新されること'
+  );
+  assert.strictEqual(
+    inputSheetT3.getRange(8, 4).getDataValidation().listValues.length,
+    6,
+    'setupAllSheets 実行後に既存D列の8行目プルダウンが6択へ更新されること'
+  );
+
+  recordPass(
+    'タスク3 setupAllSheetsによる既存列6択更新',
+    'setupAllSheets 実行時、既存データ列の値・Note・チェックボックス状態を消さずに8行目プルダウンが6択へ更新されること'
+  );
+
+  // [タスク4] 空の受診日を「今日」にせず保留する（登録対象外3分類は受診日空でもクリアされる）
+  state.activeSpreadsheet = new MockSpreadsheet();
+  sandbox.setupAllSheets();
+  const masterSheetT4 = state.activeSpreadsheet.getSheetByName('施設マスター');
+  masterSheetT4.getRange(2, 1, 1, 7).setValues([
+    ['TEST-01', '○○中央病院', '東京都千代田区1-1', '03-0000-0001', '', '', ''],
+  ]);
+  const ledgerSheetT4 = state.activeSpreadsheet.getSheetByName(sandbox.getLedgerSheetName());
+  // 台帳に未返書の前方レコードを1件用意（受診日が空の返書が誤って今日の日付で5重ロック照合・PUT消込されないことを確認するため）
+  ledgerSheetT4.getRange(2, 1, 1, 18).setValues([
+    [
+      '701',
+      '2026-10-01 09:00:00',
+      '2026-10-01',
+      '70002',
+      '鈴木花子',
+      '前方（紹介・受入）',
+      '外来',
+      'TEST-01',
+      '○○中央病院',
+      '内科',
+      '佐藤一郎',
+      '内科（一般）',
+      '大江健介',
+      '未作成',
+      '',
+      '',
+      '不要',
+      '',
+    ],
+  ]);
+
+  const inputSheetT4 = state.activeSpreadsheet.getSheetByName('紹介・逆紹介入力');
+  // 5列展開:
+  // Col 3 (C): 前方＋受診日空 ("")＋入院 -> 5行目は空、4行目は「⚠ 受診日未確定のため保留」、15行目はFALSE、POST/第一報/台帳/クリアしない
+  // Col 4 (D): 返書＋受診日解析不能 ("受診日不明") -> 5行目は空、4行目は「⚠ 受診日未確定のため保留」、18行目は照合スキップ＆Note「受診日が空のため照合できません」
+  // Col 5 (E): フェーズ空 ("")＋受診日空 ("") -> 4行目はフェーズ未確定を優先（「⚠ 連携フェーズ未確定のため保留」）、5行目は空
+  // Col 6 (F): 報告書・お手紙＋受診日空 ("") -> 登録対象外のため受診日が空でも完了クリアされる
+  // Col 7 (G): 教示依頼（照会）＋受診日空 ("") -> 登録対象外のため受診日が空でも完了クリアされる
+  sandbox.expandJsonAndMatchLedger(
+    JSON.stringify([
+      {
+        受診日: '',
+        患者ID: '70001',
+        患者氏名: '山田太郎',
+        連携フェーズ: '前方（紹介・受入）',
+        受入形態: '入院',
+        連携先施設名: '○○中央病院',
+        連携先医師名: '佐藤一郎',
+        当院担当診療科: '内科',
+        担当医師: '大江健介',
+        備考: '受診日不明',
+      },
+      {
+        受診日: '受診日不明',
+        患者ID: '70002',
+        患者氏名: '鈴木花子',
+        連携フェーズ: '返書（経過・結果報告）',
+        受入形態: '外来',
+        連携先施設名: '○○中央病院',
+        連携先医師名: '佐藤一郎',
+      },
+      {
+        受診日: '',
+        患者ID: '70003',
+        患者氏名: '高橋三郎',
+        連携フェーズ: '',
+        受入形態: '外来',
+        連携先施設名: '○○中央病院',
+      },
+      {
+        受診日: '',
+        患者ID: '70004',
+        患者氏名: '田中四郎',
+        連携フェーズ: '退院報告', // -> 報告書・お手紙
+        受入形態: '外来',
+        連携先施設名: '○○中央病院',
+      },
+      {
+        受診日: '',
+        患者ID: '70005',
+        患者氏名: '伊藤五郎',
+        連携フェーズ: '照会', // -> 教示依頼（照会）
+        受入形態: '外来',
+        連携先施設名: '○○中央病院',
+      },
+    ]),
+    state.activeSpreadsheet
+  );
+
+  // 展開直後の検証
+  assert.strictEqual(inputSheetT4.getRange(5, 3).getValue(), '', '受診日が空のJSONは今日の日付にならず5行目が空文字であること');
+  assert.strictEqual(
+    inputSheetT4.getRange(4, 3).getValue(),
+    '⚠ 受診日未確定のため保留',
+    '前方で受診日が空の列は4行目が「⚠ 受診日未確定のため保留」になること'
+  );
+  assert.strictEqual(
+    inputSheetT4.getRange(15, 3).getValue(),
+    false,
+    '受診日が空の列は入院でも15行目（第一報作成）が自動でTRUEにならないこと'
+  );
+
+  assert.strictEqual(inputSheetT4.getRange(5, 4).getValue(), '', '解析不能な受診日文字列も5行目が空文字になること');
+  assert.strictEqual(
+    inputSheetT4.getRange(4, 4).getValue(),
+    '⚠ 受診日未確定のため保留',
+    '返書で受診日が空の列も4行目が「⚠ 受診日未確定のため保留」になること'
+  );
+  assert.strictEqual(inputSheetT4.getRange(18, 4).getValue(), '', '受診日が空の返書は5重ロック照合がスキップされ18行目が空であること');
+  assert.strictEqual(
+    inputSheetT4.getRange(18, 4).getNote(),
+    '受診日が空のため照合できません',
+    '受診日が空の返書は18行目のNoteに「受診日が空のため照合できません」と残ること'
+  );
+
+  assert.strictEqual(
+    inputSheetT4.getRange(4, 5).getValue(),
+    '⚠ 連携フェーズ未確定のため保留',
+    'フェーズ未確定と受診日未確定が同時のときは4行目はフェーズ未確定が優先されること'
+  );
+  assert.strictEqual(inputSheetT4.getRange(5, 5).getValue(), '', '同時未確定列の5行目も空のままであること');
+
+  // あえて15行目をTRUE・18行目にターゲットIDを入れても、受診日未確定なら第一報生成・POST・PUTされないことを確認
+  inputSheetT4.getRange(15, 3).setValue(true);
+  inputSheetT4.getRange(18, 4).setValue('kintone#701 / 台帳#2 (2026-10-01受診分)');
+
+  state.httpRequests.length = 0;
+  sandbox.executeFirstReportGenerationOnly();
+  assert.strictEqual(inputSheetT4.getRange(16, 3).getValue(), '', '受診日未確定の列では第一報ドキュメントが生成されないこと');
+
+  const batchResT4 = sandbox.executeBatchProcess();
+  assert.strictEqual(batchResT4.docsGenerated, 0, '受診日未確定列は一括実行でも第一報生成されないこと');
+  assert.strictEqual(batchResT4.kintonePosted, 0, '受診日未確定列はkintone POSTされないこと');
+  assert.strictEqual(batchResT4.kintonePutUpdated, 0, '受診日未確定列は返書PUTされないこと');
+  assert.strictEqual(batchResT4.autoClearedCount, 2, '受診日が空でも登録対象外3分類の2列（報告書・照会）は完了クリアされること');
+  assert.strictEqual(ledgerSheetT4.getLastRow(), 2, '受診日未確定列が台帳に追記されないこと');
+
+  // 残った3列（C:山田太郎[受診日未確定], D:鈴木花子[受診日未確定], E:高橋三郎[フェーズ未確定]）がシートに残っていること
+  assert.strictEqual(inputSheetT4.getRange(7, 3).getValue(), '山田太郎');
+  assert.strictEqual(inputSheetT4.getRange(4, 3).getValue(), '⚠ 受診日未確定のため保留');
+  assert.strictEqual(inputSheetT4.getRange(5, 3).getValue(), '');
+  assert.strictEqual(inputSheetT4.getRange(7, 4).getValue(), '鈴木花子');
+  assert.strictEqual(inputSheetT4.getRange(4, 4).getValue(), '⚠ 受診日未確定のため保留');
+  assert.strictEqual(inputSheetT4.getRange(7, 5).getValue(), '高橋三郎');
+  assert.strictEqual(inputSheetT4.getRange(4, 5).getValue(), '⚠ 連携フェーズ未確定のため保留');
+
+  // C列に受診日を入力して再実行すると正常にPOST・台帳追記・クリアされること
+  inputSheetT4.getRange(15, 3).setValue(false);
+  inputSheetT4.getRange(5, 3).setValue('2026-10-31');
+  const retryBatchT4 = sandbox.executeBatchProcess();
+  assert.strictEqual(retryBatchT4.kintonePosted, 1, '受診日を入力して再実行するとkintone POSTされること');
+  assert.strictEqual(ledgerSheetT4.getLastRow(), 3, '受診日を入力して再実行すると台帳に追記されること');
+
+  recordPass(
+    'タスク4 空の受診日の保留',
+    '受診日が空または解析不能のとき今日の日付にならず「⚠ 受診日未確定のため保留」としてPOST・PUT・第一報・台帳追記・クリアから除外され、登録対象外3分類のみ受診日空でもクリアされること'
   );
 }
 

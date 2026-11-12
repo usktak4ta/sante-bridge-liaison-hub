@@ -496,13 +496,101 @@ function downloadMigrationCsv(ss) {
 }
 
 /**
+ * 移行シートの対象行（受診日・患者ID・患者氏名のいずれかがあるデータ行）の登録状況を検査する
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet
+ * @return {{
+ *   targetRowCount: number,
+ *   migratedRowCount: number,
+ *   unmigratedRowCount: number,
+ *   lastRow: number
+ * }}
+ */
+function inspectPastMigrationSheetRows(sheet) {
+  if (!sheet || sheet.getLastRow() < 2) {
+    return {
+      targetRowCount: 0,
+      migratedRowCount: 0,
+      unmigratedRowCount: 0,
+      lastRow: sheet ? sheet.getLastRow() : 0,
+    };
+  }
+
+  const migratedIdColNum = ensureMigratedRecordIdColumn(sheet);
+  const migratedIdColIdx = migratedIdColNum - 1; // 16
+  const lastRow = sheet.getLastRow();
+  const rows = sheet
+    .getRange(2, 1, lastRow - 1, PAST_MIGRATION_HEADERS.length)
+    .getValues();
+
+  let targetRowCount = 0;
+  let migratedRowCount = 0;
+  let unmigratedRowCount = 0;
+
+  rows.forEach((row) => {
+    const rawVisitDate = String(row[0] !== undefined && row[0] !== null ? row[0] : '').trim();
+    const visitDate = normalizeValidVisitDateYMD(row[0]) || rawVisitDate;
+    const patientId = String(row[1] !== undefined && row[1] !== null ? row[1] : '').trim();
+    const patientName = String(row[2] !== undefined && row[2] !== null ? row[2] : '').trim();
+    if (!visitDate && !patientId && !patientName) return;
+
+    targetRowCount++;
+    const migratedId = String(row[migratedIdColIdx] || '').trim();
+    if (migratedId !== '') {
+      migratedRowCount++;
+    } else {
+      unmigratedRowCount++;
+    }
+  });
+
+  return {
+    targetRowCount: targetRowCount,
+    migratedRowCount: migratedRowCount,
+    unmigratedRowCount: unmigratedRowCount,
+    lastRow: lastRow,
+  };
+}
+
+/**
+ * 移行シート（【kintone一括登録用】紹介・逆紹介）の1行目ヘッダと列の書式（文字列書式 @ 等）を残したまま、
+ * 2行目以降のデータ行のみをクリアする共通関数（シート自体は削除しない）
+ *
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet
+ * @return {number} クリアしたデータ行数
+ */
+function clearPastMigrationSheetDataRows(sheet) {
+  if (!sheet) return 0;
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return 0;
+
+  const numDataRows = lastRow - 1;
+  const maxCols = Math.max(sheet.getLastColumn(), PAST_MIGRATION_HEADERS.length);
+  const dataRange = sheet.getRange(2, 1, numDataRows, maxCols);
+  dataRange.clearContent();
+  dataRange.clearNote();
+
+  // 受診日（1列目）・患者ID（2列目）・返書日（14列目）・移行済レコードID（17列目）の文字列書式 @ を維持
+  sheet.getRange(2, 1, numDataRows, 2).setNumberFormat('@');
+  sheet.getRange(2, 14, numDataRows, 1).setNumberFormat('@');
+  sheet.getRange(2, PAST_MIGRATION_HEADERS.length, numDataRows, 1).setNumberFormat('@');
+
+  return numDataRows;
+}
+
+/**
  * 【タスク4-3】『【kintone一括登録用】紹介・逆紹介』のデータを読み取り、
  * ルックアップ自動コピー先の「連携先施設名_0」や空の日付・空のドロップダウン項目を除外した上で、
  * 100件単位で kintone アプリBへ一括 POST し、発番された ids を「移行済レコードID」列へ記録するとともに年度別連携台帳へも同時反映する
- * （既に「移行済レコードID」列に値がある行はスキップし、二重登録を防止する）
+ * （既に「移行済レコードID」列に値がある行はスキップし、二重登録を防止する。全対象行の登録完了時は確認のうえで展開データをクリアできる）
  *
  * @param {GoogleAppsScript.Spreadsheet.Spreadsheet=} ss
- * @return {{postedCount: number, ledgerAppendedCount: number, skippedCount: number, ids: Array<string>}}
+ * @return {{
+ *   postedCount: number,
+ *   ledgerAppendedCount: number,
+ *   skippedCount: number,
+ *   unmigratedCount: number,
+ *   clearedAfterPost: boolean,
+ *   ids: Array<string>
+ * }}
  */
 function sendPastDataToKintoneAppB(ss) {
   const spreadsheet = ss || SpreadsheetApp.getActiveSpreadsheet();
@@ -531,15 +619,21 @@ function sendPastDataToKintoneAppB(ss) {
 
   rows.forEach((row, rowIdx) => {
     const sheetRowNumber = rowIdx + 2;
-    const visitDate = formatDateYMD(row[0]);
+    const rawVisitDate = String(row[0] !== undefined && row[0] !== null ? row[0] : '').trim();
+    const visitDate = normalizeValidVisitDateYMD(row[0]);
     const patientId = String(row[1] || '').trim();
     const patientName = String(row[2] || '').trim();
-    if (!visitDate && !patientId && !patientName) return;
+    if (!rawVisitDate && !visitDate && !patientId && !patientName) return;
 
     // 既に「移行済レコードID」が記録されている行は POST・台帳追記ともにスキップ
     const existingMigratedId = String(row[migratedIdColIdx] || '').trim();
     if (existingMigratedId !== '') {
       skippedCount++;
+      return;
+    }
+
+    // 受診日が空または不正な対象行は送信せず未送信行として残す
+    if (!visitDate) {
       return;
     }
 
@@ -552,7 +646,7 @@ function sendPastDataToKintoneAppB(ss) {
     const facilityDoctorVal = String(row[10] || '').trim();
     const ourDeptVal = String(row[11] || '').trim();
     const ourDoctorVal = String(row[12] || '').trim();
-    const replyDateVal = formatDateYMD(row[13]);
+    const replyDateVal = normalizeValidVisitDateYMD(row[13]);
     const replyStatusVal = String(row[14] || '').trim();
     const remarksVal = String(row[15] || '').trim();
 
@@ -582,12 +676,28 @@ function sendPastDataToKintoneAppB(ss) {
   });
 
   if (migrationRecords.length === 0) {
+    const currentStatus = inspectPastMigrationSheetRows(sheet);
+    if (currentStatus.unmigratedRowCount > 0) {
+      const unmigMsg = `未送信の行が ${currentStatus.unmigratedRowCount}件 残っているため、シートはクリアせず保持しました（受診日等を確認してください）。`;
+      spreadsheet.toast(unmigMsg, '⚠️ 未送信データあり', 8);
+      return {
+        postedCount: 0,
+        ledgerAppendedCount: 0,
+        skippedCount: skippedCount,
+        unmigratedCount: currentStatus.unmigratedRowCount,
+        clearedAfterPost: false,
+        ids: [],
+      };
+    }
+
     const skipMsg = `新規移行対象は 0件 です（移行済スキップ: ${skippedCount}件）。`;
     spreadsheet.toast(skipMsg, 'ℹ️ 過去データ一括移行', 8);
     return {
       postedCount: 0,
       ledgerAppendedCount: 0,
       skippedCount: skippedCount,
+      unmigratedCount: 0,
+      clearedAfterPost: false,
       ids: [],
     };
   }
@@ -633,13 +743,50 @@ function sendPastDataToKintoneAppB(ss) {
       },
     });
 
-    const doneMsg = `過去データ ${postedCount}件 を kintone アプリBへ一括登録し、年度別連携台帳へ ${ledgerAppendedCount}件 反映しました（移行済スキップ: ${skippedCount}件）。`;
-    spreadsheet.toast(doneMsg, '🎉 過去データ一括移行完了', 8);
+    const postStatus = inspectPastMigrationSheetRows(sheet);
+    let clearedAfterPost = false;
+
+    if (
+      postStatus.unmigratedRowCount > 0 ||
+      ledgerAppendedCount < migrationRecords.length
+    ) {
+      const remainCount = Math.max(
+        postStatus.unmigratedRowCount,
+        migrationRecords.length - ledgerAppendedCount
+      );
+      const remainMsg = `過去データ ${postedCount}件 を登録しましたが、未送信・未完了の行が ${remainCount}件 残っているためシートのクリアは行いません。`;
+      spreadsheet.toast(remainMsg, '⚠️ 未送信データあり', 8);
+    } else if (postStatus.targetRowCount > 0 && postStatus.unmigratedRowCount === 0) {
+      const doneMsg = `過去データ ${postedCount}件 を kintone アプリBへ一括登録し、年度別連携台帳へ ${ledgerAppendedCount}件 反映しました（移行済スキップ: ${skippedCount}件）。`;
+      spreadsheet.toast(doneMsg, '🎉 過去データ一括移行完了', 8);
+
+      if (typeof SpreadsheetApp !== 'undefined' && SpreadsheetApp.getUi) {
+        const ui = SpreadsheetApp.getUi();
+        const confirmPrompt =
+          'kintone登録が完了しました。【kintone一括登録用】紹介・逆紹介 シートの展開データをクリアしますか？（CSVで控えを取っていない場合は先に②を実行してください）';
+        const response = ui.alert(
+          '🧹 移行用シートのクリア確認',
+          confirmPrompt,
+          ui.ButtonSet.YES_NO
+        );
+        if (response === ui.Button.YES) {
+          clearPastMigrationSheetDataRows(sheet);
+          clearedAfterPost = true;
+          spreadsheet.toast(
+            `【kintone一括登録用】紹介・逆紹介 シートの展開データ（${postStatus.targetRowCount}件）をクリアしました。`,
+            '🧹 シートクリア完了',
+            6
+          );
+        }
+      }
+    }
 
     return {
       postedCount: postedCount,
       ledgerAppendedCount: ledgerAppendedCount,
       skippedCount: skippedCount,
+      unmigratedCount: postStatus.unmigratedRowCount,
+      clearedAfterPost: clearedAfterPost,
       ids: allIssuedIds,
     };
   } catch (err) {
@@ -656,4 +803,103 @@ function sendPastDataToKintoneAppB(ss) {
     spreadsheet.toast(`過去データ移行エラー: ${err.message}`, '🚨 移行中断', 10);
     throw err;
   }
+}
+
+/**
+ * 【タスク1: メニュー④】『4️⃣ 移行用シートのリセット（登録済み確認後）』
+ * すべての対象行に「移行済レコードID」が入っているときだけ、1行目ヘッダと書式を残してデータ行をクリアする。
+ * 未送信行が1行でもある場合は拒否し、未送信件数を通知する（強制クリアは行わない）。
+ *
+ * @param {GoogleAppsScript.Spreadsheet.Spreadsheet=} ss
+ * @return {{
+ *   cleared: boolean,
+ *   clearedRowCount: number,
+ *   targetRowCount: number,
+ *   unmigratedCount: number
+ * }}
+ */
+function resetPastDataMigrationSheet(ss) {
+  const spreadsheet = ss || SpreadsheetApp.getActiveSpreadsheet();
+  const migrationSheetName =
+    (SANTE_CONFIG.SHEETS && SANTE_CONFIG.SHEETS.PAST_MIGRATION) ||
+    '【kintone一括登録用】紹介・逆紹介';
+  const sheet = spreadsheet.getSheetByName(migrationSheetName);
+
+  if (!sheet || sheet.getLastRow() < 2) {
+    spreadsheet.toast(
+      `シート「${migrationSheetName}」にクリア対象のデータ行がありません。`,
+      'ℹ️ 移行用シートのリセット',
+      6
+    );
+    return {
+      cleared: false,
+      clearedRowCount: 0,
+      targetRowCount: 0,
+      unmigratedCount: 0,
+    };
+  }
+
+  const status = inspectPastMigrationSheetRows(sheet);
+  if (status.targetRowCount === 0) {
+    spreadsheet.toast(
+      `シート「${migrationSheetName}」にクリア対象のデータ行がありません。`,
+      'ℹ️ 移行用シートのリセット',
+      6
+    );
+    return {
+      cleared: false,
+      clearedRowCount: 0,
+      targetRowCount: 0,
+      unmigratedCount: 0,
+    };
+  }
+
+  // 未送信行が1行でも残っている場合は強制クリアせず拒否する
+  if (status.unmigratedRowCount > 0) {
+    const refuseMsg = `未送信の行が ${status.unmigratedRowCount}件 残っているため、移行用シートをリセットできません（対象全 ${status.targetRowCount}件）。先に「3️⃣ kintoneアプリBへ一括POST＋年度別台帳反映」を実行してください。`;
+    if (typeof SpreadsheetApp !== 'undefined' && SpreadsheetApp.getUi) {
+      const ui = SpreadsheetApp.getUi();
+      ui.alert('⚠️ リセット不可（未送信データあり）', refuseMsg, ui.ButtonSet.OK);
+    }
+    spreadsheet.toast(refuseMsg, '⚠️ リセット不可', 8);
+    return {
+      cleared: false,
+      clearedRowCount: 0,
+      targetRowCount: status.targetRowCount,
+      unmigratedCount: status.unmigratedRowCount,
+    };
+  }
+
+  if (typeof SpreadsheetApp !== 'undefined' && SpreadsheetApp.getUi) {
+    const ui = SpreadsheetApp.getUi();
+    const confirmMsg = `全 ${status.targetRowCount}件 のkintone登録（移行済レコードID）が確認できました。\n「${migrationSheetName}」シートの展開データをクリアしますか？\n（※リセットは取り消せません。CSVで控えを取っていない場合は先に②を実行してください）`;
+    const response = ui.alert(
+      '🧹 移行用シートのリセット確認',
+      confirmMsg,
+      ui.ButtonSet.YES_NO
+    );
+    if (response !== ui.Button.YES) {
+      spreadsheet.toast('移行用シートのリセットをキャンセルしました。', 'ℹ️ キャンセル', 5);
+      return {
+        cleared: false,
+        clearedRowCount: 0,
+        targetRowCount: status.targetRowCount,
+        unmigratedCount: 0,
+      };
+    }
+  }
+
+  clearPastMigrationSheetDataRows(sheet);
+  spreadsheet.toast(
+    `「${migrationSheetName}」シートのデータ行（${status.targetRowCount}件）をリセットしました（ヘッダーと書式は保持されています）。`,
+    '🧹 移行用シートのリセット完了',
+    6
+  );
+
+  return {
+    cleared: true,
+    clearedRowCount: status.targetRowCount,
+    targetRowCount: status.targetRowCount,
+    unmigratedCount: 0,
+  };
 }

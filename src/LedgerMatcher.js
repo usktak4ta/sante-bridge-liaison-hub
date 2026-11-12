@@ -577,6 +577,12 @@ function findFiveLockTarget(inputRecord, facilityMasterList, ss) {
     return emptyResult;
   }
 
+  // 受診日が空または未確定の場合は今日の日付で照合せずスキップする
+  const validVisitDate = normalizeValidVisitDateYMD(inputRecord.visitDate);
+  if (!validVisitDate) {
+    return emptyResult;
+  }
+
   const masterList = facilityMasterList || loadFacilityMasterList(ss);
   const resolvedInputFacility = resolveFacility(inputRecord.facilityName, masterList);
   if (inputRecord.lookupKey && !resolvedInputFacility.lookupKey) {
@@ -711,10 +717,12 @@ function appendRecordsToLedger(recordsToAppend, ss) {
   }
 
   const spreadsheet = ss || SpreadsheetApp.getActiveSpreadsheet();
-  // 会計年度ごとにグループ化して一括追記
+  // 会計年度ごとにグループ化して一括追記（受診日が空のレコードは台帳行を作らない）
   const groupedByFy = {};
   recordsToAppend.forEach((rec) => {
-    const fy = getFiscalYear(rec.visitDate);
+    const validVisitDate = normalizeValidVisitDateYMD(rec.visitDate);
+    if (!validVisitDate) return;
+    const fy = getFiscalYear(validVisitDate);
     if (!groupedByFy[fy]) {
       groupedByFy[fy] = [];
     }
