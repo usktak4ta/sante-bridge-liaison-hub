@@ -69,11 +69,13 @@ const SANTE_CONFIG = Object.freeze({
     ],
   },
 
-  // 連携フェーズ定数
+  // 連携フェーズ定数（入力シート上は6分類、kintoneアプリB側は従来4択のまま）
   PHASES: {
     FORWARD: '前方（紹介・受入）',
     BACKWARD: '後方（逆紹介・送出）',
     REPLY: '返書（経過・結果報告）',
+    REPORT_LETTER: '報告書・お手紙',
+    INQUIRY: '教示依頼（照会）',
     OTHER: 'その他（介護連携・対診）',
   },
 
@@ -107,6 +109,8 @@ const SANTE_CONFIG = Object.freeze({
     PENDING: '⏳ 未連携',
     SYNCED: '✅ kintone反映済',
     DOC_READY: '📄 第一報作成済（未連携）',
+    EXCLUDED_DONE: '✅ 登録対象外（完了）',
+    PHASE_UNRESOLVED: '⚠ 連携フェーズ未確定のため保留',
   },
 
   // タブ②: 年度別連携台帳 カラム定義（A列〜R列: 全18列）
@@ -2005,9 +2009,10 @@ function sendKintoneRequestWithAutoRecovery(
  * 発番された全レコードID配列を返す
  *
  * @param {Array<Object>} recordsData 登録対象のレコードオブジェクト配列
+ * @param {{onChunkSuccess?: function(Array<Object>, Array<string>, number): void}=} options チャンク成功時コールバック
  * @return {{ids: Array<string>, revisions: Array<string>, excludedFields: Array<string>}}
  */
-function postRecordsToKintoneBatch(recordsData) {
+function postRecordsToKintoneBatch(recordsData, options) {
   if (!recordsData || recordsData.length === 0) {
     return { ids: [], revisions: [], excludedFields: [] };
   }
@@ -2017,6 +2022,8 @@ function postRecordsToKintoneBatch(recordsData) {
   const allIds = [];
   const allRevisions = [];
   const sharedExcludedFields = new Set();
+  const onChunkSuccess =
+    options && typeof options.onChunkSuccess === 'function' ? options.onChunkSuccess : null;
 
   for (let offset = 0; offset < recordsData.length; offset += batchLimit) {
     const chunk = recordsData.slice(offset, offset + batchLimit);
@@ -2033,11 +2040,13 @@ function postRecordsToKintoneBatch(recordsData) {
       }
     );
 
-    if (Array.isArray(parsed.ids)) {
-      parsed.ids.forEach((id) => allIds.push(String(id)));
-    }
+    const chunkIds = Array.isArray(parsed.ids) ? parsed.ids.map((id) => String(id)) : [];
+    chunkIds.forEach((id) => allIds.push(id));
     if (Array.isArray(parsed.revisions)) {
       parsed.revisions.forEach((rev) => allRevisions.push(String(rev)));
+    }
+    if (onChunkSuccess) {
+      onChunkSuccess(chunk, chunkIds, offset);
     }
   }
 
@@ -2747,6 +2756,7 @@ const PAST_MIGRATION_HEADERS = Object.freeze([
   '返書日',
   '返書ステータス',
   '備考・連絡事項',
+  '移行済レコードID',
 ]);
 
 /**
@@ -2842,7 +2852,45 @@ function classifyPastRecordReplyStatus(rawReplyDate, rawDoneFlag, rawInquiry, ra
 }
 
 /**
- * 過去月別タブの1行（0始まり row[0]〜row[13]）を移行シート用の16列データへ変換する純粋関数
+ * 過去データのM列（row[12] 問い合わせ）に除外キーワード（報告 → 照会 → 教示）が含まれるか判定する
+ * ※ 先に当たった1理由のみを返し、同じ行を二重カウントしない。「逆紹介」は「報告」を含まないため除外されない。
+ *
+ * @param {string} rawInquiry
+ * @return {'報告'|'照会'|'教示'|''} スキップ理由（除外対象外の場合は ''）
+ */
+function detectPastRowSkipReason(rawInquiry) {
+  const inquiry = String(rawInquiry || '').trim();
+  if (!inquiry) return '';
+  if (inquiry.includes('報告')) return '報告';
+  if (inquiry.includes('照会')) return '照会';
+  if (inquiry.includes('教示')) return '教示';
+  return '';
+}
+
+/**
+ * 移行シート（【kintone一括登録用】紹介・逆紹介）の17列目に「移行済レコードID」ヘッダが存在することを保証する
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet
+ * @return {number} 移行済レコードID列の1-based列番号（17）
+ */
+function ensureMigratedRecordIdColumn(sheet) {
+  const migratedIdColNum = PAST_MIGRATION_HEADERS.length; // 17
+  if (!sheet) return migratedIdColNum;
+  const migratedIdHeader = PAST_MIGRATION_HEADERS[migratedIdColNum - 1];
+  const currentHeader = String(sheet.getRange(1, migratedIdColNum).getValue() || '').trim();
+  if (currentHeader !== migratedIdHeader) {
+    sheet
+      .getRange(1, migratedIdColNum)
+      .setValue(migratedIdHeader)
+      .setBackground('#0F4C5C')
+      .setFontColor('#FFFFFF')
+      .setFontWeight('bold')
+      .setHorizontalAlignment('center');
+  }
+  return migratedIdColNum;
+}
+
+/**
+ * 過去月別タブの1行（0始まり row[0]〜row[13]）を移行シート用の17列データへ変換する純粋関数
  * @param {Array<*>} row
  * @param {Array<Object>} facilityMasterList
  * @return {{
@@ -2863,6 +2911,12 @@ function transformPastSheetRow(row, facilityMasterList) {
   const patientId = String(row[1] !== undefined && row[1] !== null ? row[1] : '').trim();
   const patientName = String(row[2] !== undefined && row[2] !== null ? row[2] : '').trim();
   if (!patientId && !patientName) {
+    return null;
+  }
+
+  // row[12]: 問い合わせに「報告」「照会」「教示」が含まれる行は classifyPastRecordReplyStatus より前に除外
+  const rawInquiry = String(row[12] || '').trim();
+  if (detectPastRowSkipReason(rawInquiry)) {
     return null;
   }
 
@@ -2891,7 +2945,6 @@ function transformPastSheetRow(row, facilityMasterList) {
   const visitType = normalizeVisitTypeValue(row[6]);
 
   // row[7], row[8]: 当院診療科・医師（現役11名・9診療科正規化）
-  const rawInquiry = String(row[12] || '').trim();
   const rawRemarks = String(row[13] || '').trim();
   const ourNormalized = normalizeOurDeptAndDoctor(row[7], row[8], rawInquiry, rawRemarks);
 
@@ -2927,6 +2980,7 @@ function transformPastSheetRow(row, facilityMasterList) {
     statusInfo.replyDate,   // 13: 返書日
     statusInfo.replyStatus, // 14: 返書ステータス
     combinedRemarks,        // 15: 備考・連絡事項
+    '',                     // 16: 移行済レコードID
   ];
 
   return {
@@ -2945,6 +2999,8 @@ function transformPastSheetRow(row, facilityMasterList) {
  * @return {{
  *   totalCount: number,
  *   countsByStatus: Object<string, number>,
+ *   skippedByReason: Object<string, number>,
+ *   skippedCount: number,
  *   processedSheets: Array<string>
  * }}
  */
@@ -2960,6 +3016,11 @@ function buildPastDataMigrationSheet(ss) {
     [SANTE_CONFIG.REPLY_STATUS.NOT_REQUIRED]: 0,
     [SANTE_CONFIG.REPLY_STATUS.UNCREATED]: 0,
     [SANTE_CONFIG.REPLY_STATUS.NOT_APPLICABLE]: 0,
+  };
+  const skippedByReason = {
+    報告: 0,
+    照会: 0,
+    教示: 0,
   };
 
   allSheets.forEach((sheet) => {
@@ -2995,7 +3056,26 @@ function buildPastDataMigrationSheet(ss) {
     processedSheets.push(sheetName);
 
     for (let r = headerRowIdx + 1; r < values.length; r++) {
-      const transformed = transformPastSheetRow(values[r], facilityMasterList);
+      const row = values[r];
+      if (!row || !Array.isArray(row)) continue;
+      const visitDate = formatDateYMD(row[0]);
+      if (!visitDate || visitDate === '来院日' || !/^\d{4}-\d{2}-\d{2}$/.test(visitDate)) {
+        continue;
+      }
+      const patientId = String(row[1] !== undefined && row[1] !== null ? row[1] : '').trim();
+      const patientName = String(row[2] !== undefined && row[2] !== null ? row[2] : '').trim();
+      if (!patientId && !patientName) {
+        continue;
+      }
+
+      // M列（row[12] 問い合わせ）の除外判定（報告 → 照会 → 教示 の順で先に当たった1理由のみカウント）
+      const skipReason = detectPastRowSkipReason(row[12]);
+      if (skipReason) {
+        skippedByReason[skipReason]++;
+        continue;
+      }
+
+      const transformed = transformPastSheetRow(row, facilityMasterList);
       if (!transformed) continue;
 
       outputRows.push(transformed.rowArray);
@@ -3028,9 +3108,10 @@ function buildPastDataMigrationSheet(ss) {
   outSheet.setFrozenRows(1);
 
   if (outputRows.length > 0) {
-    // 患者ID列（2列目）と受診日列（1列目）・返書日列（14列目）を文字列書式に維持
+    // 患者ID列（2列目）と受診日列（1列目）・返書日列（14列目）・移行済レコードID列（17列目）を文字列書式に維持
     outSheet.getRange(2, 1, outputRows.length, 2).setNumberFormat('@');
     outSheet.getRange(2, 14, outputRows.length, 1).setNumberFormat('@');
+    outSheet.getRange(2, PAST_MIGRATION_HEADERS.length, outputRows.length, 1).setNumberFormat('@');
     outSheet
       .getRange(2, 1, outputRows.length, PAST_MIGRATION_HEADERS.length)
       .setValues(outputRows);
@@ -3043,6 +3124,9 @@ function buildPastDataMigrationSheet(ss) {
     `・返書不要（医師判断）: ${countsByStatus[SANTE_CONFIG.REPLY_STATUS.NOT_REQUIRED]}件`,
     `・未作成: ${countsByStatus[SANTE_CONFIG.REPLY_STATUS.UNCREATED]}件`,
     `・対象外（逆紹介等）: ${countsByStatus[SANTE_CONFIG.REPLY_STATUS.NOT_APPLICABLE]}件`,
+    `・スキップ（報告）: ${skippedByReason['報告']}件`,
+    `・スキップ（照会）: ${skippedByReason['照会']}件`,
+    `・スキップ（教示）: ${skippedByReason['教示']}件`,
   ].join('\n');
 
   try {
@@ -3062,6 +3146,9 @@ function buildPastDataMigrationSheet(ss) {
   return {
     totalCount: outputRows.length,
     countsByStatus: countsByStatus,
+    skippedByReason: skippedByReason,
+    skippedCount:
+      skippedByReason['報告'] + skippedByReason['照会'] + skippedByReason['教示'],
     processedSheets: processedSheets,
   };
 }
@@ -3109,6 +3196,8 @@ function downloadMigrationCsv(ss) {
     );
   }
 
+  ensureMigratedRecordIdColumn(sheet);
+
   const lastRow = sheet.getLastRow();
   const matrix = sheet
     .getRange(1, 1, lastRow, PAST_MIGRATION_HEADERS.length)
@@ -3145,10 +3234,11 @@ function downloadMigrationCsv(ss) {
 /**
  * 【タスク4-3】『【kintone一括登録用】紹介・逆紹介』のデータを読み取り、
  * ルックアップ自動コピー先の「連携先施設名_0」や空の日付・空のドロップダウン項目を除外した上で、
- * 100件単位で kintone アプリBへ一括 POST し、発番された ids とともに年度別連携台帳へも同時反映する
+ * 100件単位で kintone アプリBへ一括 POST し、発番された ids を「移行済レコードID」列へ記録するとともに年度別連携台帳へも同時反映する
+ * （既に「移行済レコードID」列に値がある行はスキップし、二重登録を防止する）
  *
  * @param {GoogleAppsScript.Spreadsheet.Spreadsheet=} ss
- * @return {{postedCount: number, ledgerAppendedCount: number, ids: Array<string>}}
+ * @return {{postedCount: number, ledgerAppendedCount: number, skippedCount: number, ids: Array<string>}}
  */
 function sendPastDataToKintoneAppB(ss) {
   const spreadsheet = ss || SpreadsheetApp.getActiveSpreadsheet();
@@ -3163,6 +3253,9 @@ function sendPastDataToKintoneAppB(ss) {
     );
   }
 
+  const migratedIdColNum = ensureMigratedRecordIdColumn(sheet);
+  const migratedIdColIdx = migratedIdColNum - 1; // 16
+
   const lastRow = sheet.getLastRow();
   const rows = sheet
     .getRange(2, 1, lastRow - 1, PAST_MIGRATION_HEADERS.length)
@@ -3170,12 +3263,21 @@ function sendPastDataToKintoneAppB(ss) {
 
   const nowStr = formatDateTimeNow();
   const migrationRecords = [];
+  let skippedCount = 0;
 
-  rows.forEach((row) => {
+  rows.forEach((row, rowIdx) => {
+    const sheetRowNumber = rowIdx + 2;
     const visitDate = formatDateYMD(row[0]);
     const patientId = String(row[1] || '').trim();
     const patientName = String(row[2] || '').trim();
     if (!visitDate && !patientId && !patientName) return;
+
+    // 既に「移行済レコードID」が記録されている行は POST・台帳追記ともにスキップ
+    const existingMigratedId = String(row[migratedIdColIdx] || '').trim();
+    if (existingMigratedId !== '') {
+      skippedCount++;
+      return;
+    }
 
     const phaseVal = String(row[4] || row[3] || SANTE_CONFIG.PHASES.FORWARD).trim();
     const visitTypeVal = String(row[5] || '').trim();
@@ -3191,6 +3293,7 @@ function sendPastDataToKintoneAppB(ss) {
     const remarksVal = String(row[15] || '').trim();
 
     migrationRecords.push({
+      _sheetRowNumber: sheetRowNumber,
       registeredAt: nowStr,
       visitDate: visitDate,
       patientId: patientId,
@@ -3215,45 +3318,65 @@ function sendPastDataToKintoneAppB(ss) {
   });
 
   if (migrationRecords.length === 0) {
-    return { postedCount: 0, ledgerAppendedCount: 0, ids: [] };
+    const skipMsg = `新規移行対象は 0件 です（移行済スキップ: ${skippedCount}件）。`;
+    spreadsheet.toast(skipMsg, 'ℹ️ 過去データ一括移行', 8);
+    return {
+      postedCount: 0,
+      ledgerAppendedCount: 0,
+      skippedCount: skippedCount,
+      ids: [],
+    };
   }
 
+  let postedCount = 0;
+  let ledgerAppendedCount = 0;
+  const allIssuedIds = [];
+
   try {
-    // 1. 既存の postRecordsToKintoneBatch（100件分割・Auto-Recovery付）で kintone アプリBへ一括登録
-    const postResult = postRecordsToKintoneBatch(migrationRecords);
-    const issuedIds = postResult.ids || [];
+    // 100件チャンク成功ごとに移行シートの「移行済レコードID」列への書き込みと年度別台帳追記を確定する
+    postRecordsToKintoneBatch(migrationRecords, {
+      onChunkSuccess: (chunk, chunkIds) => {
+        chunk.forEach((rec, idx) => {
+          const recId = chunkIds[idx] || '';
+          sheet.getRange(rec._sheetRowNumber, migratedIdColNum).setValue(recId);
+        });
 
-    // 2. 返却されたレコードIDを付与して年度別連携台帳へ一括追記（5重ロック・リマインド連動）
-    const ledgerRecords = migrationRecords.map((rec, idx) => ({
-      kintoneRecordId: issuedIds[idx] || '',
-      registeredAt: rec.registeredAt,
-      visitDate: rec.visitDate,
-      patientId: rec.patientId,
-      patientName: rec.patientName,
-      phase: rec.phase,
-      visitType: rec.visitType,
-      lookupKey: rec.lookupKey,
-      facilityName: rec._ledgerFacilityName,
-      facilityDept: rec.facilityDept,
-      facilityDoctor: rec.facilityDoctor,
-      ourDept: rec.ourDept,
-      ourDoctor: rec.ourDoctor,
-      replyStatus: rec.replyStatus,
-      replyDate: rec.replyDate,
-      firstReportUrl: '',
-      faxStatus: SANTE_CONFIG.FAX_STATUS.NOT_REQUIRED,
-      remarks: rec.remarks,
-    }));
+        const chunkLedgerRecords = chunk.map((rec, idx) => ({
+          kintoneRecordId: chunkIds[idx] || '',
+          registeredAt: rec.registeredAt,
+          visitDate: rec.visitDate,
+          patientId: rec.patientId,
+          patientName: rec.patientName,
+          phase: rec.phase,
+          visitType: rec.visitType,
+          lookupKey: rec.lookupKey,
+          facilityName: rec._ledgerFacilityName,
+          facilityDept: rec.facilityDept,
+          facilityDoctor: rec.facilityDoctor,
+          ourDept: rec.ourDept,
+          ourDoctor: rec.ourDoctor,
+          replyStatus: rec.replyStatus,
+          replyDate: rec.replyDate,
+          firstReportUrl: '',
+          faxStatus: SANTE_CONFIG.FAX_STATUS.NOT_REQUIRED,
+          remarks: rec.remarks,
+        }));
 
-    const appendedMeta = appendRecordsToLedger(ledgerRecords, spreadsheet);
+        const appendedMeta = appendRecordsToLedger(chunkLedgerRecords, spreadsheet);
+        postedCount += chunk.length;
+        ledgerAppendedCount += appendedMeta.length;
+        chunkIds.forEach((id) => allIssuedIds.push(id));
+      },
+    });
 
-    const doneMsg = `過去データ ${migrationRecords.length}件 を kintone アプリBへ一括登録し、年度別連携台帳へ ${appendedMeta.length}件 反映しました。`;
+    const doneMsg = `過去データ ${postedCount}件 を kintone アプリBへ一括登録し、年度別連携台帳へ ${ledgerAppendedCount}件 反映しました（移行済スキップ: ${skippedCount}件）。`;
     spreadsheet.toast(doneMsg, '🎉 過去データ一括移行完了', 8);
 
     return {
-      postedCount: migrationRecords.length,
-      ledgerAppendedCount: appendedMeta.length,
-      ids: issuedIds,
+      postedCount: postedCount,
+      ledgerAppendedCount: ledgerAppendedCount,
+      skippedCount: skippedCount,
+      ids: allIssuedIds,
     };
   } catch (err) {
     notifySlackError(
@@ -3261,6 +3384,8 @@ function sendPastDataToKintoneAppB(ss) {
       err,
       {
         targetRecordCount: String(migrationRecords.length),
+        completedBeforeErrorCount: String(postedCount),
+        skippedCount: String(skippedCount),
       },
       { includeStack: false }
     );
@@ -3403,22 +3528,42 @@ function parseGeminiJsonInput(rawText) {
 }
 
 /**
- * 連携フェーズ文字列を4つの正規選択肢のいずれかに正規化する
+ * 連携フェーズ文字列を6つの正規選択肢のいずれかに正規化する（未知値・空文字は '' を返す）
  * @param {string} rawPhase
  * @return {string}
  */
 function normalizePhaseValue(rawPhase) {
   const s = String(rawPhase || '').trim();
+  if (!s) return '';
   const phases = SANTE_CONFIG.PHASES;
 
-  if (s === phases.FORWARD || s === phases.BACKWARD || s === phases.REPLY || s === phases.OTHER) {
+  if (
+    s === phases.FORWARD ||
+    s === phases.BACKWARD ||
+    s === phases.REPLY ||
+    s === phases.REPORT_LETTER ||
+    s === phases.INQUIRY ||
+    s === phases.OTHER
+  ) {
     return s;
   }
   if (s.includes('逆紹介') || s.includes('後方') || s.includes('送出')) {
     return phases.BACKWARD;
   }
+  if (
+    s.includes('報告書') ||
+    s.includes('お手紙') ||
+    s.includes('受診報告') ||
+    s.includes('退院報告') ||
+    s.includes('死亡報告')
+  ) {
+    return phases.REPORT_LETTER;
+  }
   if (s.includes('返書') || s.includes('経過') || s.includes('結果報告')) {
     return phases.REPLY;
+  }
+  if (s.includes('教示') || s.includes('照会')) {
+    return phases.INQUIRY;
   }
   if (s.includes('その他') || s.includes('介護') || s.includes('対診')) {
     return phases.OTHER;
@@ -3426,7 +3571,22 @@ function normalizePhaseValue(rawPhase) {
   if (s.includes('前方') || s.includes('紹介') || s.includes('受入')) {
     return phases.FORWARD;
   }
-  return phases.FORWARD;
+  return '';
+}
+
+/**
+ * kintone新規登録・台帳追記・返書消込を行わず完了扱いとする連携フェーズかを判定する
+ * （報告書・お手紙 / 教示依頼（照会） / その他（介護連携・対診））
+ * @param {string} phase
+ * @return {boolean}
+ */
+function isExcludedNoRegisterPhase(phase) {
+  const p = String(phase || '').trim();
+  return (
+    p === SANTE_CONFIG.PHASES.REPORT_LETTER ||
+    p === SANTE_CONFIG.PHASES.INQUIRY ||
+    p === SANTE_CONFIG.PHASES.OTHER
+  );
 }
 
 /**
@@ -3623,13 +3783,15 @@ function applyInputColumnValidations(inputSheet, startCol, numCols) {
   // 6行目（患者ID）をテキスト書式（先頭ゼロ維持）に設定
   inputSheet.getRange(rows.PATIENT_ID, startCol, 1, numCols).setNumberFormat('@');
 
-  // 8行目: 連携フェーズ プルダウン
+  // 8行目: 連携フェーズ プルダウン（入力シート上は6分類）
   const phaseRule = SpreadsheetApp.newDataValidation()
     .requireValueInList(
       [
         SANTE_CONFIG.PHASES.FORWARD,
         SANTE_CONFIG.PHASES.BACKWARD,
         SANTE_CONFIG.PHASES.REPLY,
+        SANTE_CONFIG.PHASES.REPORT_LETTER,
+        SANTE_CONFIG.PHASES.INQUIRY,
         SANTE_CONFIG.PHASES.OTHER,
       ],
       true
@@ -3752,7 +3914,11 @@ function expandJsonAndMatchLedger(rawJsonText, ss) {
       }
     }
 
-    statusRowValues.push(SANTE_CONFIG.COLUMN_SYNC_STATUS.PENDING);
+    statusRowValues.push(
+      rec.phase
+        ? SANTE_CONFIG.COLUMN_SYNC_STATUS.PENDING
+        : SANTE_CONFIG.COLUMN_SYNC_STATUS.PHASE_UNRESOLVED
+    );
 
     // 5行目〜19行目（index 0〜14）へのマッピング
     columnMatrix[0][colIdx] = rec.visitDate;           // 5行目: 受診日
@@ -3862,7 +4028,7 @@ function readAllInputColumns(inputSheet) {
       visitDate: visitDate || formatDateYMD(new Date()),
       patientId: patientId,
       patientName: patientName,
-      phase: phase ? normalizePhaseValue(phase) : SANTE_CONFIG.PHASES.FORWARD,
+      phase: normalizePhaseValue(phase),
       visitType: normalizeVisitTypeValue(values[5][c]),
       facilityName: facilityName,
       facilityDept: String(values[7][c] || '').trim(),
@@ -3890,7 +4056,8 @@ function readAllInputColumns(inputSheet) {
  *   docsGenerated: number,
  *   kintonePosted: number,
  *   kintonePutUpdated: number,
- *   ledgerUpdated: number
+ *   ledgerUpdated: number,
+ *   autoClearedCount?: number
  * }}
  */
 function executeBatchProcess() {
@@ -3930,10 +4097,39 @@ function executeBatchProcess() {
 
   try {
     // =========================================================================
-    // Step 1: 第一報（受診・入院報告書）Googleドキュメント生成
-    // （15行目 `📝 第一報作成` が TRUE かつ 16行目が空欄の列）
+    // Step 0: 未分類（空）保留と登録対象外3分類（報告書・お手紙 / 教示依頼（照会） / その他）の振り分け
     // =========================================================================
     columns.forEach((colData) => {
+      if (!colData.phase) {
+        inputSheet
+          .getRange(statusRow, colData.colNumber)
+          .setValue(SANTE_CONFIG.COLUMN_SYNC_STATUS.PHASE_UNRESOLVED)
+          .setBackground('#fff2cc');
+        colData.syncStatus = SANTE_CONFIG.COLUMN_SYNC_STATUS.PHASE_UNRESOLVED;
+        return;
+      }
+
+      if (isExcludedNoRegisterPhase(colData.phase)) {
+        if (colData.targetRecordInfo) {
+          inputSheet
+            .getRange(rows.TARGET_RECORD_INFO, colData.colNumber)
+            .setNote('登録対象外のため返書消込は行いません');
+        }
+        inputSheet
+          .getRange(statusRow, colData.colNumber)
+          .setValue(SANTE_CONFIG.COLUMN_SYNC_STATUS.EXCLUDED_DONE)
+          .setBackground('#d9ead3');
+        colData.syncStatus = SANTE_CONFIG.COLUMN_SYNC_STATUS.EXCLUDED_DONE;
+        syncedColNumbersSet.add(colData.colNumber);
+      }
+    });
+
+    // =========================================================================
+    // Step 1: 第一報（受診・入院報告書）Googleドキュメント生成
+    // （15行目 `📝 第一報作成` が TRUE かつ 16行目が空欄の列。未分類・登録対象外列は除外）
+    // =========================================================================
+    columns.forEach((colData) => {
+      if (!colData.phase || isExcludedNoRegisterPhase(colData.phase)) return;
       if (colData.needFirstReport && !colData.reportDocUrl) {
         const docResult = generateFirstReportDoc(colData, facilityMasterList);
         colData.reportDocUrl = docResult.docUrl;
@@ -3950,10 +4146,13 @@ function executeBatchProcess() {
 
     // =========================================================================
     // Step 2: kintone（アプリB / ID: 195）への一括POST（新規登録）と台帳追記
-    // （連携フェーズが「前方」または「後方」の未連携列。「返書」単体はPOSTしない）
+    // （連携フェーズが「前方」または「後方」の未連携列のみ。「返書」および登録対象外3分類・未分類はPOSTしない）
     // =========================================================================
     const postCandidateCols = columns.filter((colData) => {
-      if (colData.syncStatus === SANTE_CONFIG.COLUMN_SYNC_STATUS.SYNCED) {
+      if (
+        colData.syncStatus === SANTE_CONFIG.COLUMN_SYNC_STATUS.SYNCED ||
+        colData.syncStatus === SANTE_CONFIG.COLUMN_SYNC_STATUS.EXCLUDED_DONE
+      ) {
         return false;
       }
       return (
@@ -4065,11 +4264,17 @@ function executeBatchProcess() {
 
     // =========================================================================
     // Step 3: kintone（アプリB）への一括PUT（返書日消込）と年度別台帳更新
-    // （18行目に `kintone#<レコードID>` が入っている列）
-    // ※ 連携フェーズが純粋な「返書（経過・結果報告）」の場合はStep 2をスキップし、本Step 3のみ実行される
+    // （連携フェーズが「返書」または「後方」で、18行目に `kintone#<レコードID>` が入っている列）
+    // ※ 登録対象外3分類・未分類列は18行目にIDがあってもPUTしない
     // =========================================================================
     const putCandidateItems = [];
     columns.forEach((colData) => {
+      if (
+        colData.phase !== SANTE_CONFIG.PHASES.REPLY &&
+        colData.phase !== SANTE_CONFIG.PHASES.BACKWARD
+      ) {
+        return;
+      }
       if (!colData.targetRecordInfo) return;
 
       // 既に返書消込が完了している純粋返書列は二重PUTしない
@@ -4129,7 +4334,7 @@ function executeBatchProcess() {
       });
     }
 
-    // Step 4: 今回の一括実行でkintone連携・台帳反映が成功した列（および C2:C3）を自動クリア
+    // Step 4: 今回の一括実行で完了した列（同期成功列および登録対象外列）と C2:C3 を自動クリアし、未処理列を左詰め整理
     let autoClearedCount = 0;
     if (syncedColNumbersSet.size > 0) {
       const clearRes = clearSyncedInputColumnsAfterBatch(
@@ -4193,6 +4398,7 @@ function executeFirstReportGenerationOnly() {
   let count = 0;
 
   columns.forEach((colData) => {
+    if (!colData.phase || isExcludedNoRegisterPhase(colData.phase)) return;
     if (colData.needFirstReport && !colData.reportDocUrl) {
       const res = generateFirstReportDoc(colData, facilityMasterList);
       inputSheet.getRange(rows.REPORT_DOC_URL, colData.colNumber).setValue(res.docUrl);
@@ -4268,21 +4474,91 @@ function reRunFiveLockMatchingForAllColumns() {
 }
 
 /**
- * 一括実行（executeBatchProcess）で kintone 送信および年度別連携台帳への反映が成功した列について、
+ * 残存する未処理列スナップショット配列を C列（startCol=3）から左詰めで再配置し、
+ * 入力規則（6分類プルダウン等）・数値書式・15/17行目チェックボックス・セルNote・4行目背景色を保持する共通ヘルパー
+ *
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} inputSheet
+ * @param {Array<{values: Array<Array<*>>, notes: Array<Array<string>>, syncStatus: string}>} remainingColumns
+ * @param {number} numColsToClear C列からクリア対象とする列幅
+ */
+function rewriteRemainingInputColumnsLeft(inputSheet, remainingColumns, numColsToClear) {
+  const startCol = SANTE_CONFIG.INPUT_LAYOUT.DATA_START_COL;
+  const statusRow = SANTE_CONFIG.INPUT_LAYOUT.STATUS_ROW;
+  const rowEnd = SANTE_CONFIG.INPUT_LAYOUT.ROW_END;
+  const totalRows = rowEnd - statusRow + 1; // 4〜19行目 (16行)
+  const rows = SANTE_CONFIG.INPUT_LAYOUT.ROWS;
+
+  if (numColsToClear > 0) {
+    const clearRange = inputSheet.getRange(statusRow, startCol, totalRows, numColsToClear);
+    clearRange.clearContent();
+    clearRange.clearNote();
+    clearRange.clearDataValidations();
+    clearRange.setBackground(null);
+  }
+
+  const remCount = remainingColumns.length;
+  if (remCount > 0) {
+    applyInputColumnValidations(inputSheet, startCol, remCount);
+
+    const newValues = Array.from({ length: totalRows }, () => new Array(remCount).fill(''));
+    const newNotes = Array.from({ length: totalRows }, () => new Array(remCount).fill(''));
+    const needReportOffset = rows.NEED_FIRST_REPORT - statusRow;
+    const faxSentOffset = rows.FAX_SENT - statusRow;
+
+    remainingColumns.forEach((colObj, cIdx) => {
+      for (let r = 0; r < totalRows; r++) {
+        let cellVal = colObj.values[r][0];
+        if (r === needReportOffset || r === faxSentOffset) {
+          cellVal = cellVal === true || String(cellVal).toUpperCase() === 'TRUE';
+        }
+        newValues[r][cIdx] = cellVal;
+        newNotes[r][cIdx] = colObj.notes[r][0];
+      }
+    });
+
+    const targetRange = inputSheet.getRange(statusRow, startCol, totalRows, remCount);
+    targetRange.setValues(newValues);
+    targetRange.setNotes(newNotes);
+
+    // 4行目の背景色を復元
+    for (let cIdx = 0; cIdx < remCount; cIdx++) {
+      const cell = inputSheet.getRange(statusRow, startCol + cIdx);
+      cell.setHorizontalAlignment('center').setFontWeight('bold');
+      const st = remainingColumns[cIdx].syncStatus;
+      if (
+        st === SANTE_CONFIG.COLUMN_SYNC_STATUS.SYNCED ||
+        st === SANTE_CONFIG.COLUMN_SYNC_STATUS.EXCLUDED_DONE
+      ) {
+        cell.setBackground('#d9ead3');
+      } else {
+        cell.setBackground('#fff2cc');
+      }
+    }
+  }
+
+  // 空いた末尾列の15行目・17行目チェックボックスを false にリセット
+  for (let c = startCol + remCount; c < startCol + numColsToClear; c++) {
+    inputSheet.getRange(rows.NEED_FIRST_REPORT, c).setValue(false);
+    inputSheet.getRange(rows.FAX_SENT, c).setValue(false);
+  }
+}
+
+/**
+ * 一括実行（executeBatchProcess）で kintone 送信および年度別連携台帳への反映が成功した列（または登録対象外完了列）について、
  * 4行目ステータス、5〜19行目の値・背景色・セルNote、および C2:C3 貼付セルを自動クリアし、
- * 15行目・17行目のチェックボックスを false にリセットする
- * （エラー列・未処理列・施設名部分一致保留列はそのまま残す）
+ * 15行目・17行目のチェックボックスを false にリセットした上で、
+ * 残った未処理列（部分一致保留・返書ターゲット未特定・連携フェーズ未確定等）を C列開始へ左詰め整理する
  *
  * @param {GoogleAppsScript.Spreadsheet.Sheet=} inputSheet
- * @param {Array<number>} syncedColNumbers 今回同期に成功した1-based列番号配列
- * @return {{clearedCount: number, clearedColumns: Array<number>, pasteRangeCleared: boolean}}
+ * @param {Array<number>} syncedColNumbers 今回完了した1-based列番号配列
+ * @return {{clearedCount: number, clearedColumns: Array<number>, remainingCount: number, pasteRangeCleared: boolean}}
  */
 function clearSyncedInputColumnsAfterBatch(inputSheet, syncedColNumbers) {
   const sheet =
     inputSheet ||
     SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SANTE_CONFIG.SHEETS.INPUT);
   if (!sheet) {
-    return { clearedCount: 0, clearedColumns: [], pasteRangeCleared: false };
+    return { clearedCount: 0, clearedColumns: [], remainingCount: 0, pasteRangeCleared: false };
   }
 
   const pasteRange = sheet.getRange(SANTE_CONFIG.INPUT_LAYOUT.PASTE_RANGE);
@@ -4292,9 +4568,10 @@ function clearSyncedInputColumnsAfterBatch(inputSheet, syncedColNumbers) {
     new Set((syncedColNumbers || []).map((n) => Number(n)).filter((n) => n >= 3))
   );
   if (uniqueCols.length === 0) {
-    return { clearedCount: 0, clearedColumns: [], pasteRangeCleared: true };
+    return { clearedCount: 0, clearedColumns: [], remainingCount: 0, pasteRangeCleared: true };
   }
 
+  const startCol = SANTE_CONFIG.INPUT_LAYOUT.DATA_START_COL;
   const statusRow = SANTE_CONFIG.INPUT_LAYOUT.STATUS_ROW;
   const rowEnd = SANTE_CONFIG.INPUT_LAYOUT.ROW_END;
   const totalRows = rowEnd - statusRow + 1; // 4〜19行目 (16行)
@@ -4311,9 +4588,29 @@ function clearSyncedInputColumnsAfterBatch(inputSheet, syncedColNumbers) {
     sheet.getRange(rows.FAX_SENT, colNum).setValue(false);
   });
 
+  // 残った未処理列があれば C列開始へ左詰め整理する
+  const remainingColsMeta = readAllInputColumns(sheet);
+  const needsLeftPack = remainingColsMeta.some(
+    (colData, idx) => colData.colNumber !== startCol + idx
+  );
+  if (needsLeftPack) {
+    const maxCol = Math.max(sheet.getLastColumn(), ...uniqueCols);
+    const numColsToClear = maxCol >= startCol ? maxCol - startCol + 1 : 0;
+    const remainingSnapshots = remainingColsMeta.map((colData) => {
+      const colRange = sheet.getRange(statusRow, colData.colNumber, totalRows, 1);
+      return {
+        values: colRange.getValues(),
+        notes: colRange.getNotes(),
+        syncStatus: colData.syncStatus,
+      };
+    });
+    rewriteRemainingInputColumnsLeft(sheet, remainingSnapshots, numColsToClear);
+  }
+
   return {
     clearedCount: uniqueCols.length,
     clearedColumns: uniqueCols,
+    remainingCount: remainingColsMeta.length,
     pasteRangeCleared: true,
   };
 }
@@ -4321,7 +4618,7 @@ function clearSyncedInputColumnsAfterBatch(inputSheet, syncedColNumbers) {
 /**
  * 【要件B-4: 送信完了列のクリア機能】
  * 17行目 `✅ FAX送信完了` がチェックされた列、または
- * 15行目 `📝 第一報作成` が FALSE かつ kintone反映が完了した列を安全にクリアし、
+ * 15行目 `📝 第一報作成` が FALSE かつ kintone反映が完了した列（および登録対象外列）を安全にクリアし、
  * 未完了の列を左詰め（C列開始）に整理する
  *
  * @return {{clearedCount: number, remainingCount: number}}
@@ -4347,11 +4644,13 @@ function clearCompletedColumns() {
   let clearedCount = 0;
 
   columns.forEach((colData) => {
-    const isSynced = colData.syncStatus === SANTE_CONFIG.COLUMN_SYNC_STATUS.SYNCED;
-    // FAX送信完了チェック済（かつkintone連携済、またはFAX完了優先）または（第一報不要 かつ kintone反映済）
+    const isSynced =
+      colData.syncStatus === SANTE_CONFIG.COLUMN_SYNC_STATUS.SYNCED ||
+      colData.syncStatus === SANTE_CONFIG.COLUMN_SYNC_STATUS.EXCLUDED_DONE;
+    // FAX送信完了チェック済（かつkintone連携済、または登録対象外）または（第一報不要 かつ 完了済）
     const canClear =
       (colData.faxSent && isSynced) ||
-      (colData.faxSent && colData.phase === SANTE_CONFIG.PHASES.OTHER) ||
+      (colData.faxSent && isExcludedNoRegisterPhase(colData.phase)) ||
       (!colData.needFirstReport && isSynced);
 
     if (canClear) {
@@ -4375,44 +4674,8 @@ function clearCompletedColumns() {
     return { clearedCount: 0, remainingCount: columns.length };
   }
 
-  // C列以降の既存データ領域を一旦クリア
   const numExistingCols = lastCol - startCol + 1;
-  const clearRange = inputSheet.getRange(statusRow, startCol, totalRows, numExistingCols);
-  clearRange.clearContent();
-  clearRange.clearNote();
-  clearRange.clearDataValidations();
-  clearRange.setBackground(null);
-
-  // 未完了の列が残っている場合はC列から左詰めで再配置
-  if (remainingColumns.length > 0) {
-    const remCount = remainingColumns.length;
-    applyInputColumnValidations(inputSheet, startCol, remCount);
-
-    const newValues = Array.from({ length: totalRows }, () => new Array(remCount).fill(''));
-    const newNotes = Array.from({ length: totalRows }, () => new Array(remCount).fill(''));
-
-    remainingColumns.forEach((colObj, cIdx) => {
-      for (let r = 0; r < totalRows; r++) {
-        newValues[r][cIdx] = colObj.values[r][0];
-        newNotes[r][cIdx] = colObj.notes[r][0];
-      }
-    });
-
-    const targetRange = inputSheet.getRange(statusRow, startCol, totalRows, remCount);
-    targetRange.setValues(newValues);
-    targetRange.setNotes(newNotes);
-
-    // 4行目の背景色を復元
-    for (let cIdx = 0; cIdx < remCount; cIdx++) {
-      const cell = inputSheet.getRange(statusRow, startCol + cIdx);
-      cell.setHorizontalAlignment('center').setFontWeight('bold');
-      if (remainingColumns[cIdx].syncStatus === SANTE_CONFIG.COLUMN_SYNC_STATUS.SYNCED) {
-        cell.setBackground('#d9ead3');
-      } else {
-        cell.setBackground('#fff2cc');
-      }
-    }
-  }
+  rewriteRemainingInputColumnsLeft(inputSheet, remainingColumns, numExistingCols);
 
   ss.toast(
     `完了済みの ${clearedCount}列 をクリアし、未完了 ${remainingColumns.length}列 を左詰め整理しました。`,

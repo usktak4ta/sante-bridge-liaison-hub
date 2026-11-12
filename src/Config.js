@@ -60,11 +60,13 @@ const SANTE_CONFIG = Object.freeze({
     ],
   },
 
-  // 連携フェーズ定数
+  // 連携フェーズ定数（入力シート上は6分類、kintoneアプリB側は従来4択のまま）
   PHASES: {
     FORWARD: '前方（紹介・受入）',
     BACKWARD: '後方（逆紹介・送出）',
     REPLY: '返書（経過・結果報告）',
+    REPORT_LETTER: '報告書・お手紙',
+    INQUIRY: '教示依頼（照会）',
     OTHER: 'その他（介護連携・対診）',
   },
 
@@ -98,6 +100,8 @@ const SANTE_CONFIG = Object.freeze({
     PENDING: '⏳ 未連携',
     SYNCED: '✅ kintone反映済',
     DOC_READY: '📄 第一報作成済（未連携）',
+    EXCLUDED_DONE: '✅ 登録対象外（完了）',
+    PHASE_UNRESOLVED: '⚠ 連携フェーズ未確定のため保留',
   },
 
   // タブ②: 年度別連携台帳 カラム定義（A列〜R列: 全18列）

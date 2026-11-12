@@ -128,17 +128,46 @@ class MockRange {
     return this;
   }
   clearDataValidations() {
+    for (let r = 0; r < this.numRows; r++) {
+      for (let c = 0; c < this.numCols; c++) {
+        this.sheet._getCell(this.row + r, this.col + c).dataValidation = null;
+      }
+    }
     return this;
   }
-  setNumberFormat() {
+  setNumberFormat(fmt) {
+    for (let r = 0; r < this.numRows; r++) {
+      for (let c = 0; c < this.numCols; c++) {
+        this.sheet._getCell(this.row + r, this.col + c).numberFormat = String(fmt || '');
+      }
+    }
     return this;
+  }
+  getNumberFormat() {
+    return this.sheet._getCell(this.row, this.col).numberFormat || '';
   }
   setDataValidation(rule) {
     this.sheet._lastDataValidation = rule;
+    for (let r = 0; r < this.numRows; r++) {
+      for (let c = 0; c < this.numCols; c++) {
+        this.sheet._getCell(this.row + r, this.col + c).dataValidation = rule;
+      }
+    }
     return this;
   }
+  getDataValidation() {
+    return this.sheet._getCell(this.row, this.col).dataValidation || null;
+  }
   insertCheckboxes() {
+    for (let r = 0; r < this.numRows; r++) {
+      for (let c = 0; c < this.numCols; c++) {
+        this.sheet._getCell(this.row + r, this.col + c).hasCheckbox = true;
+      }
+    }
     return this;
+  }
+  hasCheckbox() {
+    return Boolean(this.sheet._getCell(this.row, this.col).hasCheckbox);
   }
   setBorder() {
     return this;
@@ -398,6 +427,16 @@ const sandbox = {
       }
       // kintone REST API
       if (url.includes('/k/v1/records.json')) {
+        state.kintoneCallCounter = (state.kintoneCallCounter || 0) + 1;
+        if (
+          state.failOnKintoneCallNumber &&
+          state.kintoneCallCounter === state.failOnKintoneCallNumber
+        ) {
+          return {
+            getResponseCode: () => 500,
+            getContentText: () => '{"code":"GAIA_SV01","message":"chunk error"}',
+          };
+        }
         if (state.kintoneHttpStatus && state.kintoneHttpStatus !== 200) {
           return {
             getResponseCode: () => state.kintoneHttpStatus,
@@ -1369,16 +1408,22 @@ function recordPass(category, description) {
   assert.strictEqual(batchRes.kintonePosted, 2, '2件ともkintone POSTされること');
   assert.strictEqual(batchRes.autoClearedCount, 1, '完全一致で同期完了したC列(col 3)の1列のみ自動クリアされること');
   assert.strictEqual(inputSheet.getRange('C2').getValue(), '', 'C2:C3 貼付セルがクリアされること');
-  assert.strictEqual(inputSheet.getRange(4, 3).getValue(), '', '同期成功したC列(col 3)の4行目ステータスがクリアされること');
-  assert.strictEqual(inputSheet.getRange(7, 3).getValue(), '', '同期成功したC列(col 3)の患者氏名がクリアされること');
-  assert.strictEqual(inputSheet.getRange(5, 3).getNote(), '', '同期成功したC列(col 3)のセルNoteがクリアされること');
-  assert.strictEqual(inputSheet.getRange(15, 3).getValue(), false, '同期成功したC列(col 3)の15行目チェックボックスが false になること');
-  assert.strictEqual(inputSheet.getRange(17, 3).getValue(), false, '同期成功したC列(col 3)の17行目チェックボックスが false になること');
+  // 完了したC列がクリアされた後、D列にあった部分一致保留（鈴木花子・中央病院）がC列(col 3)へ左詰めされ、D列(col 4)が空になること
   assert.strictEqual(
-    inputSheet.getRange(10, 4).getValue(),
-    '中央病院',
-    '部分一致保留のD列(col 4)はクリアされずに残ること'
+    inputSheet.getRange(7, 3).getValue(),
+    '鈴木花子',
+    '部分一致保留だったD列の患者がC列(col 3)へ左詰めされること'
   );
+  assert.strictEqual(
+    inputSheet.getRange(10, 3).getValue(),
+    '中央病院',
+    '部分一致保留の施設名がC列(col 3)に保持されること'
+  );
+  assert.strictEqual(inputSheet.getRange(4, 4).getValue(), '', '左詰め後に空いたD列(col 4)の4行目ステータスがクリアされること');
+  assert.strictEqual(inputSheet.getRange(7, 4).getValue(), '', '左詰め後に空いたD列(col 4)の患者氏名がクリアされること');
+  assert.strictEqual(inputSheet.getRange(5, 4).getNote(), '', '左詰め後に空いたD列(col 4)のセルNoteがクリアされること');
+  assert.strictEqual(inputSheet.getRange(15, 4).getValue(), false, '左詰め後に空いたD列(col 4)の15行目チェックボックスが false になること');
+  assert.strictEqual(inputSheet.getRange(17, 4).getValue(), false, '左詰め後に空いたD列(col 4)の17行目チェックボックスが false になること');
   const lastToast = state.activeSpreadsheet.toasts[state.activeSpreadsheet.toasts.length - 1];
   assert(
     lastToast &&
@@ -1395,7 +1440,7 @@ function recordPass(category, description) {
   );
   recordPass(
     'タスク3 一括実行後の自動クリア',
-    'executeBatchProcess 完了後、同期成功列と C2:C3 が自動クリア（チェックボックス false 化・Note消去）され、部分一致保留列は残ること'
+    'executeBatchProcess 完了後、同期成功列と C2:C3 が自動クリア（チェックボックス false 化・Note消去）され、部分一致保留列は左詰めされて残ること'
   );
 
   // 5-4. タスク4: 過去データ移行（4段階ステータス判定・シート合体・BOM付CSV・kintone一括POST＆台帳反映）
@@ -1507,6 +1552,516 @@ function recordPass(category, description) {
   recordPass(
     'タスク4 過去データ移行機能',
     '返書ステータス4段階自動判定・全月タブ合体・BOM付UTF-8 CSV出力・kintone一括POST＆年度別台帳同時反映が正常に動作すること'
+  );
+}
+
+// ============================================================================
+// 6. 連携フェーズ6分類・登録対象外フィルタ・左詰め・過去データ報告/照会/教示除外・再実行防止 (A〜F)
+// ============================================================================
+{
+  const santeConfig = vm.runInContext('SANTE_CONFIG', sandbox);
+
+  // [A] PHASES が6分類・8行目プルダウンに6つ設定されること
+  assert.deepStrictEqual(
+    Object.keys(santeConfig.PHASES),
+    ['FORWARD', 'BACKWARD', 'REPLY', 'REPORT_LETTER', 'INQUIRY', 'OTHER'],
+    'SANTE_CONFIG.PHASES が6キーを持つこと'
+  );
+  assert.strictEqual(santeConfig.PHASES.REPORT_LETTER, '報告書・お手紙');
+  assert.strictEqual(santeConfig.PHASES.INQUIRY, '教示依頼（照会）');
+
+  state.activeSpreadsheet = new MockSpreadsheet();
+  sandbox.setupAllSheets();
+  const inputSheet = state.activeSpreadsheet.getSheetByName('紹介・逆紹介入力');
+  sandbox.applyInputColumnValidations(inputSheet, 3, 2);
+  const phaseValidation = inputSheet.getRange(8, 3).getDataValidation();
+  assert(phaseValidation && Array.isArray(phaseValidation.listValues), '8行目に入力規則が設定されること');
+  assert.deepStrictEqual(
+    Array.from(phaseValidation.listValues),
+    [
+      '前方（紹介・受入）',
+      '後方（逆紹介・送出）',
+      '返書（経過・結果報告）',
+      '報告書・お手紙',
+      '教示依頼（照会）',
+      'その他（介護連携・対診）',
+    ],
+    '8行目プルダウンに6分類すべてが含まれること'
+  );
+  recordPass(
+    'タスクA 連携フェーズ6分類・入力規則',
+    'SANTE_CONFIG.PHASES が6分類定義され、紹介・逆紹介入力シート8行目のプルダウンに6つの選択肢が設定されること'
+  );
+
+  // [B] normalizePhaseValue エイリアス・返書との非衝突・空/未知が ''（未分類）になり前方に化けないこと
+  ['報告書', 'お手紙', '受診報告', '退院報告', '死亡報告', '報告書・お手紙'].forEach((alias) => {
+    assert.strictEqual(
+      sandbox.normalizePhaseValue(alias),
+      '報告書・お手紙',
+      `「${alias}」が「報告書・お手紙」に正規化されること`
+    );
+  });
+  ['教示', '照会', '教示依頼', '教示依頼（照会）'].forEach((alias) => {
+    assert.strictEqual(
+      sandbox.normalizePhaseValue(alias),
+      '教示依頼（照会）',
+      `「${alias}」が「教示依頼（照会）」に正規化されること`
+    );
+  });
+  ['返書（経過・結果報告）', '返書', '経過報告', '結果報告'].forEach((alias) => {
+    assert.strictEqual(
+      sandbox.normalizePhaseValue(alias),
+      '返書（経過・結果報告）',
+      `「${alias}」が報告書に奪われず「返書（経過・結果報告）」になること`
+    );
+  });
+  assert.strictEqual(sandbox.normalizePhaseValue(''), '', '空文字は空文字（未分類）を返すこと');
+  assert.strictEqual(sandbox.normalizePhaseValue('   '), '', '空白のみは空文字（未分類）を返すこと');
+  assert.strictEqual(sandbox.normalizePhaseValue('分類不能な文字列'), '', '未知値は空文字（未分類）を返し前方にしないこと');
+
+  // 未分類列の展開時ステータス・第一報チェック・一括実行での保留確認
+  state.activeSpreadsheet = new MockSpreadsheet();
+  sandbox.setupAllSheets();
+  const masterSheetB = state.activeSpreadsheet.getSheetByName('施設マスター');
+  masterSheetB.getRange(2, 1, 1, 7).setValues([
+    ['TEST-01', '○○中央病院', '東京都千代田区1-1', '03-0000-0001', '', '', ''],
+  ]);
+  const inputSheetB = state.activeSpreadsheet.getSheetByName('紹介・逆紹介入力');
+  sandbox.expandJsonAndMatchLedger(
+    JSON.stringify([
+      {
+        受診日: '2026-10-31',
+        患者ID: '12345',
+        患者氏名: '山田太郎',
+        連携フェーズ: '', // 空欄（未分類）
+        受入形態: '入院', // 入院でも未分類なら第一報チェックを TRUE にしない
+        連携先施設名: '○○中央病院',
+        連携先医師名: '佐藤一郎',
+        当院担当診療科: '内科',
+        担当医師: '大江健介',
+      },
+      {
+        受診日: '2026-10-31',
+        患者ID: '23456',
+        患者氏名: '鈴木花子',
+        連携フェーズ: '謎の文書区分', // 未知値（未分類）
+        受入形態: '外来',
+        連携先施設名: '○○中央病院',
+        連携先医師名: '佐藤一郎',
+        当院担当診療科: '内科',
+        担当医師: '大江健介',
+      },
+    ]),
+    state.activeSpreadsheet
+  );
+
+  assert.strictEqual(
+    inputSheetB.getRange(4, 3).getValue(),
+    '⚠ 連携フェーズ未確定のため保留',
+    'JSON展開時に未分類列の4行目が保留文言になること'
+  );
+  assert.strictEqual(
+    inputSheetB.getRange(8, 3).getValue(),
+    '',
+    '未分類列の8行目が勝手に前方にならず空欄であること'
+  );
+  assert.strictEqual(
+    inputSheetB.getRange(15, 3).getValue(),
+    false,
+    '未分類＋入院のとき15行目（第一報作成）が TRUE にならないこと'
+  );
+
+  state.httpRequests.length = 0;
+  const unresolvedBatchRes = sandbox.executeBatchProcess();
+  assert.strictEqual(unresolvedBatchRes.kintonePosted, 0, '未分類列はkintone POSTされないこと');
+  assert.strictEqual(unresolvedBatchRes.kintonePutUpdated, 0, '未分類列はkintone PUTされないこと');
+  assert.strictEqual(unresolvedBatchRes.autoClearedCount, 0, '未分類列は自動クリアされないこと');
+  assert.strictEqual(
+    inputSheetB.getRange(4, 3).getValue(),
+    '⚠ 連携フェーズ未確定のため保留',
+    '一括実行後も未分類列の4行目が保留文言のままであること'
+  );
+  assert.strictEqual(
+    inputSheetB.getRange(7, 3).getValue(),
+    '山田太郎',
+    '未分類列がクリアされずにシートに残ること'
+  );
+  recordPass(
+    'タスクB normalizePhaseValueエイリアス・未分類保留',
+    '6分類エイリアスが正しく判定され、空・未知のフェーズは前方に化けず「⚠ 連携フェーズ未確定のため保留」としてPOST・台帳追記・クリアから除外されること'
+  );
+
+  // [C & D] フェーズ別振り分け（前方・後方のみPOST、報告書・照会・その他は18行目IDがあってもPOST/PUTせずクリア）＋未処理列の左詰め
+  state.activeSpreadsheet = new MockSpreadsheet();
+  sandbox.setupAllSheets();
+  const masterSheetC = state.activeSpreadsheet.getSheetByName('施設マスター');
+  masterSheetC.getRange(2, 1, 2, 7).setValues([
+    ['TEST-01', '○○中央病院', '東京都千代田区1-1', '03-0000-0001', '', '', ''],
+    ['TEST-02', '△△中央病院', '東京都中央区2-2', '03-0000-0002', '', '', ''],
+  ]);
+  const ledgerSheetC = state.activeSpreadsheet.getSheetByName(sandbox.getLedgerSheetName());
+  // 後方消込ターゲット用の未返書前方レコードを台帳2行目に用意
+  ledgerSheetC.getRange(2, 1, 1, 18).setValues([
+    [
+      '501',
+      '2026-10-01 09:00:00',
+      '2026-10-01',
+      '11112',
+      '佐藤次郎',
+      '前方（紹介・受入）',
+      '外来',
+      'TEST-01',
+      '○○中央病院',
+      '内科',
+      '佐藤一郎',
+      '脳神経外科',
+      '溝上泰一朗',
+      '未作成',
+      '',
+      '',
+      '不要',
+      '',
+    ],
+  ]);
+
+  const inputSheetC = state.activeSpreadsheet.getSheetByName('紹介・逆紹介入力');
+  // 7列展開:
+  // Col 3 (C): 前方（完全一致） -> POST + 台帳追加 + クリア
+  // Col 4 (D): 報告書・お手紙（部分一致施設「中央病院」＋18行目にダミーIDあり） -> POST/PUTせず完了クリア
+  // Col 5 (E): 前方（部分一致施設「中央病院」＋17行目FAXチェックTRUE） -> POSTされるが部分一致のため残存 -> 左詰めでC列(col 3)へ移動
+  // Col 6 (F): 教示依頼（照会）（18行目にダミーIDあり） -> POST/PUTせず完了クリア
+  // Col 7 (G): 未分類（連携フェーズ空欄） -> POST/PUTせず保留残存 -> 左詰めでD列(col 4)へ移動
+  // Col 8 (H): その他（介護連携・対診）（18行目にダミーIDあり） -> POST/PUTせず完了クリア
+  // Col 9 (I): 後方（完全一致＋5重ロック一致IDあり） -> POST + 台帳追加 + PUT消込 + クリア
+  sandbox.expandJsonAndMatchLedger(
+    JSON.stringify([
+      {
+        受診日: '2026-10-31',
+        患者ID: '11111',
+        患者氏名: '山田太郎',
+        連携フェーズ: '前方（紹介・受入）',
+        受入形態: '外来',
+        連携先施設名: '○○中央病院',
+        連携先医師名: '佐藤一郎',
+        当院担当診療科: '脳神経外科',
+        担当医師: '溝上泰一朗',
+      },
+      {
+        受診日: '2026-10-31',
+        患者ID: '11113',
+        患者氏名: '高橋三郎',
+        連携フェーズ: '退院報告', // -> 報告書・お手紙
+        受入形態: '外来',
+        連携先施設名: '中央病院', // 部分一致でも登録対象外なのでクリアされる
+        連携先医師名: '佐藤一郎',
+      },
+      {
+        受診日: '2026-10-31',
+        患者ID: '11114',
+        患者氏名: '田中四郎',
+        連携フェーズ: '前方（紹介・受入）',
+        受入形態: '入院', // -> 15行目チェックボックス TRUE
+        連携先施設名: '中央病院', // 部分一致のためシートに残る
+        連携先医師名: '佐藤一郎',
+        当院担当診療科: '脳神経内科',
+        担当医師: '田中淳',
+      },
+      {
+        受診日: '2026-10-31',
+        患者ID: '11115',
+        患者氏名: '伊藤五郎',
+        連携フェーズ: '照会', // -> 教示依頼（照会）
+        受入形態: '外来',
+        連携先施設名: '○○中央病院',
+        連携先医師名: '佐藤一郎',
+      },
+      {
+        受診日: '2026-10-31',
+        患者ID: '11116',
+        患者氏名: '渡辺六郎',
+        連携フェーズ: '', // -> 未分類保留
+        受入形態: '外来',
+        連携先施設名: '○○中央病院',
+        連携先医師名: '佐藤一郎',
+      },
+      {
+        受診日: '2026-10-31',
+        患者ID: '11117',
+        患者氏名: '中村七郎',
+        連携フェーズ: '介護連携', // -> その他（介護連携・対診）
+        受入形態: '外来',
+        連携先施設名: '○○中央病院',
+        連携先医師名: '佐藤一郎',
+      },
+      {
+        受診日: '2026-10-31',
+        患者ID: '11112',
+        患者氏名: '佐藤次郎',
+        連携フェーズ: '後方（逆紹介・送出）',
+        受入形態: '外来',
+        連携先施設名: '○○中央病院',
+        連携先医師名: '佐藤一郎',
+        当院担当診療科: '脳神経外科',
+        担当医師: '溝上泰一朗',
+      },
+    ]),
+    state.activeSpreadsheet
+  );
+
+  // 登録対象外3列（Col 4, Col 6, Col 8）の18行目にあえてダミーの返書消込ターゲットIDを入れる
+  inputSheetC.getRange(18, 4).setValue('kintone#501 / 台帳#2 (2026-10-01受診分)');
+  inputSheetC.getRange(18, 6).setValue('kintone#501 / 台帳#2 (2026-10-01受診分)');
+  inputSheetC.getRange(18, 8).setValue('kintone#501 / 台帳#2 (2026-10-01受診分)');
+  // Col 5（田中四郎）の17行目FAX送信完了チェックボックスも true にして左詰め後の保持を確認
+  inputSheetC.getRange(17, 5).setValue(true);
+
+  state.httpRequests.length = 0;
+  inputSheetC._noteEvents.length = 0;
+
+  const batchResCD = sandbox.executeBatchProcess();
+  // POSTされるのは Col 3(山田太郎・前方), Col 5(田中四郎・前方), Col 9(佐藤次郎・後方) の3件のみ
+  assert.strictEqual(batchResCD.kintonePosted, 3, '前方2件＋後方1件の計3件のみがkintone POSTされること');
+  // PUTされるのは Col 9(佐藤次郎・後方) の1件のみ（登録対象外3列の18行目ダミーIDはPUTされない）
+  assert.strictEqual(batchResCD.kintonePutUpdated, 1, '後方の1件のみが返書消込PUTされ、登録対象外列の18行目IDはPUTされないこと');
+  // クリアされるのは Col 3(前方完全一致), Col 4(報告書), Col 6(照会), Col 8(その他), Col 9(後方完全一致) の5列
+  assert.strictEqual(batchResCD.autoClearedCount, 5, '完了2列＋登録対象外3列の計5列が自動クリアされること');
+
+  // 登録対象外列の18行目に「登録対象外のため返書消込は行いません」のNoteが設定された履歴があること
+  const excludedTargetNoteEvents = inputSheetC._noteEvents.filter(
+    (e) => e.row === 18 && e.note.includes('登録対象外のため返書消込は行いません')
+  );
+  assert.strictEqual(
+    excludedTargetNoteEvents.length,
+    3,
+    '登録対象外3列の18行目に「登録対象外のため返書消込は行いません」が記録されること'
+  );
+
+  // kintone POST/PUT ペイロードに「報告書・お手紙」「教示依頼（照会）」「その他（介護連携・対診）」が一切含まれないこと
+  const kintoneReqsCD = state.httpRequests.filter((r) => r.url.includes('/k/v1/records.json'));
+  kintoneReqsCD.forEach((req) => {
+    const rawStr = JSON.stringify(req.parsedPayload);
+    ['報告書・お手紙', '教示依頼（照会）', 'その他（介護連携・対診）', '高橋三郎', '伊藤五郎', '中村七郎'].forEach(
+      (forbidden) => {
+        assert(
+          !rawStr.includes(forbidden),
+          `kintone通信ペイロードに「${forbidden}」が1文字も含まれないこと`
+        );
+      }
+    );
+  });
+
+  // 台帳にも登録対象外3件や未分類1件が追加されていないこと（初期1行＋新規POST 3行＝計4行、つまりデータ3行＋ヘッダ1行＝lastRow 5）
+  assert.strictEqual(ledgerSheetC.getLastRow(), 5, '台帳には初期1件＋前方2件＋後方1件の計4件のみが存在すること');
+
+  // [D] 左詰め結果の検証:
+  // 残った2列（旧Col 5: 田中四郎[部分一致保留]、旧Col 7: 渡辺六郎[フェーズ未確定]）が C列(col 3) と D列(col 4) に左詰めされていること
+  assert.strictEqual(inputSheetC.getRange(7, 3).getValue(), '田中四郎', '1つ目の残存列（部分一致保留）がC列(col 3)へ左詰めされること');
+  assert.strictEqual(inputSheetC.getRange(6, 3).getValue(), '11114', 'C列の患者IDが保持されること');
+  assert.strictEqual(inputSheetC.getRange(5, 3).getNumberFormat(), '@', '左詰め後のC列5行目（受診日）の書式 @ が保たれること');
+  assert.strictEqual(inputSheetC.getRange(6, 3).getNumberFormat(), '@', '左詰め後のC列6行目（患者ID）の書式 @ が保たれること');
+  assert(
+    inputSheetC.getRange(10, 3).getNote().includes('施設名が部分一致のみ'),
+    '左詰め後のC列10行目に部分一致警告Noteが保たれること'
+  );
+  assert.strictEqual(inputSheetC.getRange(15, 3).hasCheckbox(), true, '左詰め後のC列15行目にチェックボックスが保たれること');
+  assert.strictEqual(inputSheetC.getRange(15, 3).getValue(), true, '左詰め後のC列15行目のチェック状態(true)が保たれること');
+  assert.strictEqual(inputSheetC.getRange(17, 3).hasCheckbox(), true, '左詰め後のC列17行目にチェックボックスが保たれること');
+  assert.strictEqual(inputSheetC.getRange(17, 3).getValue(), true, '左詰め後のC列17行目のチェック状態(true)が保たれること');
+  const col3PhaseVal = inputSheetC.getRange(8, 3).getDataValidation();
+  assert.strictEqual(col3PhaseVal.listValues.length, 6, '左詰め後のC列8行目に6分類プルダウン入力規則が保たれること');
+
+  assert.strictEqual(inputSheetC.getRange(7, 4).getValue(), '渡辺六郎', '2つ目の残存列（未分類保留）がD列(col 4)へ左詰めされること');
+  assert.strictEqual(
+    inputSheetC.getRange(4, 4).getValue(),
+    '⚠ 連携フェーズ未確定のため保留',
+    '左詰め後のD列4行目に未確定保留ステータスが保たれること'
+  );
+  assert.strictEqual(inputSheetC.getRange(15, 4).getValue(), false, '左詰め後のD列15行目チェックボックスが false で保たれること');
+
+  // E列(col 5)〜I列(col 9)は空にクリアされ、チェックボックスも false にリセットされていること
+  for (let col = 5; col <= 9; col++) {
+    assert.strictEqual(inputSheetC.getRange(4, col).getValue(), '', `左詰め後に空いた列(col ${col})の4行目が空であること`);
+    assert.strictEqual(inputSheetC.getRange(7, col).getValue(), '', `左詰め後に空いた列(col ${col})の7行目が空であること`);
+    assert.strictEqual(inputSheetC.getRange(15, col).getValue(), false, `左詰め後に空いた列(col ${col})の15行目が false であること`);
+    assert.strictEqual(inputSheetC.getRange(17, col).getValue(), false, `左詰め後に空いた列(col ${col})の17行目が false であること`);
+  }
+
+  recordPass(
+    'タスクC フェーズ別振り分け・対象外除外',
+    '前方・後方のみがkintone POST＆台帳追記され、報告書・お手紙／教示依頼（照会）／その他は18行目にIDがあってもPOST/PUTされず完了クリアされること'
+  );
+  recordPass(
+    'タスクD 完了列クリア後の左詰め整理',
+    '完了列クリア後、残った未処理列（部分一致保留・フェーズ未確定）がC列開始へ左詰めされ、値・Note・6分類プルダウン・数値書式・チェックボックスが保持されること'
+  );
+
+  // [E] 過去データ移行での「報告／照会／教示」除外と「逆紹介」維持
+  state.activeSpreadsheet = new MockSpreadsheet();
+  sandbox.setupAllSheets();
+  const masterSheetE = state.activeSpreadsheet.getSheetByName('施設マスター');
+  masterSheetE.getRange(2, 1, 1, 7).setValues([
+    ['TEST-01', '○○中央病院', '東京都千代田区1-1', '03-0000-0001', '', '', ''],
+  ]);
+  const pastSheetE = state.activeSpreadsheet.insertSheet('2026年5月');
+  const pastRowsE = [
+    [
+      '来院日',
+      '患者ID',
+      '患者氏名',
+      '紹介元病院名',
+      '紹介元診療科',
+      '紹介元医師名',
+      '受入・送出形態',
+      '当院診療科',
+      '担当医師',
+      '返書日',
+      '済/未',
+      '予備',
+      '問い合わせ', // M列 (row[12])
+      '備考',       // N列 (row[13])
+    ],
+    ['2026-05-01', '20001', '山田太郎', '○○中央病院', '内科', '佐藤一郎', '外来', '内科', '大江健介', '', '未', '', '受診報告のみ', ''], // スキップ（報告）
+    ['2026-05-02', '20002', '鈴木花子', '○○中央病院', '内科', '佐藤一郎', '外来', '内科', '大江健介', '', '未', '', '経過照会あり', ''], // スキップ（照会）
+    ['2026-05-03', '20003', '高橋三郎', '○○中央病院', '内科', '佐藤一郎', '外来', '内科', '大江健介', '', '未', '', '治療方針の教示依頼', ''], // スキップ（教示）
+    ['2026-05-04', '20004', '田中四郎', '○○中央病院', '内科', '佐藤一郎', '外来', '内科', '大江健介', '', '未', '', '報告・照会・教示すべて含む', ''], // 先に当たった「報告」1理由のみカウント
+    ['2026-05-05', '20005', '伊藤五郎', '○○中央病院', '内科', '佐藤一郎', '外来', '内科', '大江健介', '', '未', '', '逆紹介', ''], // 除外されず後方／対象外
+    ['2026-05-06', '20006', '渡辺六郎', '○○中央病院', '内科', '佐藤一郎', '外来', '内科', '大江健介', '2026-05-10', '済', '', '', ''], // 通常前方／作成・送付完了
+  ];
+  pastSheetE.getRange(1, 1, pastRowsE.length, 14).setValues(pastRowsE);
+
+  const migResE = sandbox.buildPastDataMigrationSheet(state.activeSpreadsheet);
+  assert.strictEqual(migResE.totalCount, 2, '報告・照会・教示の4行が除外され、逆紹介と通常前方の2行のみ残ること');
+  assert.deepStrictEqual(
+    { ...migResE.skippedByReason },
+    { 報告: 2, 照会: 1, 教示: 1 },
+    '理由別のスキップ件数（報告:2, 照会:1, 教示:1）が正確に集計され二重カウントしないこと'
+  );
+  assert.strictEqual(migResE.skippedCount, 4);
+  assert.strictEqual(migResE.countsByStatus['対象外'], 1, '逆紹介の行は除外されず「対象外」として1件カウントされること');
+  assert.strictEqual(migResE.countsByStatus['作成・送付完了'], 1);
+
+  const migSheetE = state.activeSpreadsheet.getSheetByName('【kintone一括登録用】紹介・逆紹介');
+  const migSheetRowsE = migSheetE.getRange(2, 1, 2, 17).getValues();
+  assert.strictEqual(migSheetRowsE[0][1], '20005', '1行目が逆紹介の患者（20005）であること');
+  assert.strictEqual(migSheetRowsE[0][4], '後方（逆紹介・送出）', '逆紹介行のフェーズが後方（逆紹介・送出）であること');
+  assert.strictEqual(migSheetRowsE[0][14], '対象外', '逆紹介行の返書ステータスが対象外であること');
+
+  const csvResE = sandbox.downloadMigrationCsv(state.activeSpreadsheet);
+  assert(!csvResE.csvContent.includes('20001') && !csvResE.csvContent.includes('20002') && !csvResE.csvContent.includes('20003'), '除外行がCSVにも一切含まれないこと');
+  assert(csvResE.csvContent.includes('移行済レコードID'), 'CSVヘッダに移行済レコードID列が含まれること');
+  recordPass(
+    'タスクE 過去データ移行の報告/照会/教示除外',
+    'M列（問い合わせ）に報告・照会・教示を含む行が除外されて理由別件数が集計され、逆紹介のみの行は除外されず後方／対象外になること'
+  );
+
+  // [F] sendPastDataToKintoneAppB の「移行済レコードID」による再実行防止と途中失敗時のチャンク保存
+  state.httpRequests.length = 0;
+  // 1回目のPOST（2件送信）
+  const firstPostF = sandbox.sendPastDataToKintoneAppB(state.activeSpreadsheet);
+  assert.strictEqual(firstPostF.postedCount, 2, '1回目は2件ともPOSTされること');
+  assert.strictEqual(firstPostF.skippedCount, 0, '1回目のスキップ件数は0件であること');
+  assert.strictEqual(migSheetE.getRange(2, 17).getValue(), '9001', '1行目の17列目（移行済レコードID）に発番ID 9001 が書き込まれること');
+  assert.strictEqual(migSheetE.getRange(3, 17).getValue(), '9002', '2行目の17列目（移行済レコードID）に発番ID 9002 が書き込まれること');
+
+  // 2回目の再実行（全件に移行済レコードIDがあるため送信0件・スキップ2件）
+  state.httpRequests.length = 0;
+  const secondPostF = sandbox.sendPastDataToKintoneAppB(state.activeSpreadsheet);
+  assert.strictEqual(secondPostF.postedCount, 0, '2回目の再実行ではPOST件数が0件になること');
+  assert.strictEqual(secondPostF.ledgerAppendedCount, 0, '2回目の再実行では台帳追記件数も0件になること');
+  assert.strictEqual(secondPostF.skippedCount, 2, '2回目の再実行ではスキップ件数が2件になること');
+  assert.strictEqual(
+    state.httpRequests.filter((r) => r.url.includes('/k/v1/records.json')).length,
+    0,
+    '全件移行済みの場合はkintone APIリクエストが1回も発生しないこと'
+  );
+
+  // 100件超（120件）で2チャンク目が失敗した場合の途中保存＆再実行テスト
+  state.activeSpreadsheet = new MockSpreadsheet();
+  sandbox.setupAllSheets();
+  const migSheet120 = state.activeSpreadsheet.insertSheet('【kintone一括登録用】紹介・逆紹介');
+  const headers16 = [
+    '受診日',
+    '患者ID',
+    '患者氏名',
+    '連携方向',
+    '連携フェーズ',
+    '受入・送出形態',
+    '更新用キー',
+    '連携先施設名_0',
+    '連携先診療科',
+    '紹介先診療科',
+    '連携先医師名',
+    '当院担当診療科',
+    '担当医師',
+    '返書日',
+    '返書ステータス',
+    '備考・連絡事項',
+  ]; // あえて旧16列ヘッダで作成し、17列目ヘッダ自動追加も検証
+  migSheet120.getRange(1, 1, 1, 16).setValues([headers16]);
+  const rows120 = Array.from({ length: 120 }, (_, i) => [
+    '2026-05-10',
+    String(30001 + i),
+    '山田太郎',
+    '前方（紹介・受入）',
+    '前方（紹介・受入）',
+    '外来',
+    'TEST-01',
+    '○○中央病院',
+    '内科',
+    '内科',
+    '佐藤一郎',
+    '内科（一般）',
+    '大江健介',
+    '2026-05-15',
+    '作成・送付完了',
+    '',
+  ]);
+  migSheet120.getRange(2, 1, 120, 16).setValues(rows120);
+
+  // 1回目の実行: 1チャンク目(100件)は成功し、2チャンク目(20件)でHTTP 500エラーを起こす
+  state.kintoneCallCounter = 0;
+  state.failOnKintoneCallNumber = 2;
+  assert.throws(() => {
+    sandbox.sendPastDataToKintoneAppB(state.activeSpreadsheet);
+  }, /HTTP 500/);
+
+  assert.strictEqual(
+    migSheet120.getRange(1, 17).getValue(),
+    '移行済レコードID',
+    '旧16列シートの17列目ヘッダに「移行済レコードID」が自動追加されること'
+  );
+  assert.strictEqual(
+    migSheet120.getRange(2, 17).getValue(),
+    '9001',
+    '途中失敗時でも1チャンク目先頭行（2行目）に移行済レコードIDが保存されていること'
+  );
+  assert.strictEqual(
+    migSheet120.getRange(101, 17).getValue(),
+    '9100',
+    '途中失敗時でも1チャンク目最終行（101行目）に移行済レコードIDが保存されていること'
+  );
+  assert.strictEqual(
+    migSheet120.getRange(102, 17).getValue(),
+    '',
+    '失敗した2チャンク目先頭行（102行目）は未記入のままであること'
+  );
+
+  // エラー解消後の再実行: 成功済みの100件はスキップされ、残りの20件だけが送信されること
+  state.failOnKintoneCallNumber = 0;
+  state.httpRequests.length = 0;
+  const retryRes120 = sandbox.sendPastDataToKintoneAppB(state.activeSpreadsheet);
+  assert.strictEqual(retryRes120.skippedCount, 100, '再実行時に成功済み100件がスキップされること');
+  assert.strictEqual(retryRes120.postedCount, 20, '再実行時に未記入の残り20件のみがPOSTされること');
+  assert.strictEqual(retryRes120.ledgerAppendedCount, 20, '再実行時に残り20件のみが台帳追記されること');
+  assert.strictEqual(
+    migSheet120.getRange(121, 17).getValue(),
+    '9020',
+    '再実行後に最終行（121行目）にも移行済レコードIDが記録されること'
+  );
+
+  recordPass(
+    'タスクF 移行済レコードIDによる再実行防止・途中失敗保護',
+    'sendPastDataToKintoneAppB で移行済レコードID列への記録・再実行スキップ・100件チャンク途中失敗時の成功分ID保持が正常に動作すること'
   );
 }
 

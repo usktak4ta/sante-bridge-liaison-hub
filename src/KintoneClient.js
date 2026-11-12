@@ -458,9 +458,10 @@ function sendKintoneRequestWithAutoRecovery(
  * 発番された全レコードID配列を返す
  *
  * @param {Array<Object>} recordsData 登録対象のレコードオブジェクト配列
+ * @param {{onChunkSuccess?: function(Array<Object>, Array<string>, number): void}=} options チャンク成功時コールバック
  * @return {{ids: Array<string>, revisions: Array<string>, excludedFields: Array<string>}}
  */
-function postRecordsToKintoneBatch(recordsData) {
+function postRecordsToKintoneBatch(recordsData, options) {
   if (!recordsData || recordsData.length === 0) {
     return { ids: [], revisions: [], excludedFields: [] };
   }
@@ -470,6 +471,8 @@ function postRecordsToKintoneBatch(recordsData) {
   const allIds = [];
   const allRevisions = [];
   const sharedExcludedFields = new Set();
+  const onChunkSuccess =
+    options && typeof options.onChunkSuccess === 'function' ? options.onChunkSuccess : null;
 
   for (let offset = 0; offset < recordsData.length; offset += batchLimit) {
     const chunk = recordsData.slice(offset, offset + batchLimit);
@@ -486,11 +489,13 @@ function postRecordsToKintoneBatch(recordsData) {
       }
     );
 
-    if (Array.isArray(parsed.ids)) {
-      parsed.ids.forEach((id) => allIds.push(String(id)));
-    }
+    const chunkIds = Array.isArray(parsed.ids) ? parsed.ids.map((id) => String(id)) : [];
+    chunkIds.forEach((id) => allIds.push(id));
     if (Array.isArray(parsed.revisions)) {
       parsed.revisions.forEach((rev) => allRevisions.push(String(rev)));
+    }
+    if (onChunkSuccess) {
+      onChunkSuccess(chunk, chunkIds, offset);
     }
   }
 

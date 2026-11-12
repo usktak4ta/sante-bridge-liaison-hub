@@ -129,22 +129,42 @@ function parseGeminiJsonInput(rawText) {
 }
 
 /**
- * 連携フェーズ文字列を4つの正規選択肢のいずれかに正規化する
+ * 連携フェーズ文字列を6つの正規選択肢のいずれかに正規化する（未知値・空文字は '' を返す）
  * @param {string} rawPhase
  * @return {string}
  */
 function normalizePhaseValue(rawPhase) {
   const s = String(rawPhase || '').trim();
+  if (!s) return '';
   const phases = SANTE_CONFIG.PHASES;
 
-  if (s === phases.FORWARD || s === phases.BACKWARD || s === phases.REPLY || s === phases.OTHER) {
+  if (
+    s === phases.FORWARD ||
+    s === phases.BACKWARD ||
+    s === phases.REPLY ||
+    s === phases.REPORT_LETTER ||
+    s === phases.INQUIRY ||
+    s === phases.OTHER
+  ) {
     return s;
   }
   if (s.includes('逆紹介') || s.includes('後方') || s.includes('送出')) {
     return phases.BACKWARD;
   }
+  if (
+    s.includes('報告書') ||
+    s.includes('お手紙') ||
+    s.includes('受診報告') ||
+    s.includes('退院報告') ||
+    s.includes('死亡報告')
+  ) {
+    return phases.REPORT_LETTER;
+  }
   if (s.includes('返書') || s.includes('経過') || s.includes('結果報告')) {
     return phases.REPLY;
+  }
+  if (s.includes('教示') || s.includes('照会')) {
+    return phases.INQUIRY;
   }
   if (s.includes('その他') || s.includes('介護') || s.includes('対診')) {
     return phases.OTHER;
@@ -152,7 +172,22 @@ function normalizePhaseValue(rawPhase) {
   if (s.includes('前方') || s.includes('紹介') || s.includes('受入')) {
     return phases.FORWARD;
   }
-  return phases.FORWARD;
+  return '';
+}
+
+/**
+ * kintone新規登録・台帳追記・返書消込を行わず完了扱いとする連携フェーズかを判定する
+ * （報告書・お手紙 / 教示依頼（照会） / その他（介護連携・対診））
+ * @param {string} phase
+ * @return {boolean}
+ */
+function isExcludedNoRegisterPhase(phase) {
+  const p = String(phase || '').trim();
+  return (
+    p === SANTE_CONFIG.PHASES.REPORT_LETTER ||
+    p === SANTE_CONFIG.PHASES.INQUIRY ||
+    p === SANTE_CONFIG.PHASES.OTHER
+  );
 }
 
 /**
@@ -349,13 +384,15 @@ function applyInputColumnValidations(inputSheet, startCol, numCols) {
   // 6行目（患者ID）をテキスト書式（先頭ゼロ維持）に設定
   inputSheet.getRange(rows.PATIENT_ID, startCol, 1, numCols).setNumberFormat('@');
 
-  // 8行目: 連携フェーズ プルダウン
+  // 8行目: 連携フェーズ プルダウン（入力シート上は6分類）
   const phaseRule = SpreadsheetApp.newDataValidation()
     .requireValueInList(
       [
         SANTE_CONFIG.PHASES.FORWARD,
         SANTE_CONFIG.PHASES.BACKWARD,
         SANTE_CONFIG.PHASES.REPLY,
+        SANTE_CONFIG.PHASES.REPORT_LETTER,
+        SANTE_CONFIG.PHASES.INQUIRY,
         SANTE_CONFIG.PHASES.OTHER,
       ],
       true
@@ -478,7 +515,11 @@ function expandJsonAndMatchLedger(rawJsonText, ss) {
       }
     }
 
-    statusRowValues.push(SANTE_CONFIG.COLUMN_SYNC_STATUS.PENDING);
+    statusRowValues.push(
+      rec.phase
+        ? SANTE_CONFIG.COLUMN_SYNC_STATUS.PENDING
+        : SANTE_CONFIG.COLUMN_SYNC_STATUS.PHASE_UNRESOLVED
+    );
 
     // 5行目〜19行目（index 0〜14）へのマッピング
     columnMatrix[0][colIdx] = rec.visitDate;           // 5行目: 受診日
@@ -588,7 +629,7 @@ function readAllInputColumns(inputSheet) {
       visitDate: visitDate || formatDateYMD(new Date()),
       patientId: patientId,
       patientName: patientName,
-      phase: phase ? normalizePhaseValue(phase) : SANTE_CONFIG.PHASES.FORWARD,
+      phase: normalizePhaseValue(phase),
       visitType: normalizeVisitTypeValue(values[5][c]),
       facilityName: facilityName,
       facilityDept: String(values[7][c] || '').trim(),
@@ -616,7 +657,8 @@ function readAllInputColumns(inputSheet) {
  *   docsGenerated: number,
  *   kintonePosted: number,
  *   kintonePutUpdated: number,
- *   ledgerUpdated: number
+ *   ledgerUpdated: number,
+ *   autoClearedCount?: number
  * }}
  */
 function executeBatchProcess() {
@@ -656,10 +698,39 @@ function executeBatchProcess() {
 
   try {
     // =========================================================================
-    // Step 1: 第一報（受診・入院報告書）Googleドキュメント生成
-    // （15行目 `📝 第一報作成` が TRUE かつ 16行目が空欄の列）
+    // Step 0: 未分類（空）保留と登録対象外3分類（報告書・お手紙 / 教示依頼（照会） / その他）の振り分け
     // =========================================================================
     columns.forEach((colData) => {
+      if (!colData.phase) {
+        inputSheet
+          .getRange(statusRow, colData.colNumber)
+          .setValue(SANTE_CONFIG.COLUMN_SYNC_STATUS.PHASE_UNRESOLVED)
+          .setBackground('#fff2cc');
+        colData.syncStatus = SANTE_CONFIG.COLUMN_SYNC_STATUS.PHASE_UNRESOLVED;
+        return;
+      }
+
+      if (isExcludedNoRegisterPhase(colData.phase)) {
+        if (colData.targetRecordInfo) {
+          inputSheet
+            .getRange(rows.TARGET_RECORD_INFO, colData.colNumber)
+            .setNote('登録対象外のため返書消込は行いません');
+        }
+        inputSheet
+          .getRange(statusRow, colData.colNumber)
+          .setValue(SANTE_CONFIG.COLUMN_SYNC_STATUS.EXCLUDED_DONE)
+          .setBackground('#d9ead3');
+        colData.syncStatus = SANTE_CONFIG.COLUMN_SYNC_STATUS.EXCLUDED_DONE;
+        syncedColNumbersSet.add(colData.colNumber);
+      }
+    });
+
+    // =========================================================================
+    // Step 1: 第一報（受診・入院報告書）Googleドキュメント生成
+    // （15行目 `📝 第一報作成` が TRUE かつ 16行目が空欄の列。未分類・登録対象外列は除外）
+    // =========================================================================
+    columns.forEach((colData) => {
+      if (!colData.phase || isExcludedNoRegisterPhase(colData.phase)) return;
       if (colData.needFirstReport && !colData.reportDocUrl) {
         const docResult = generateFirstReportDoc(colData, facilityMasterList);
         colData.reportDocUrl = docResult.docUrl;
@@ -676,10 +747,13 @@ function executeBatchProcess() {
 
     // =========================================================================
     // Step 2: kintone（アプリB / ID: 195）への一括POST（新規登録）と台帳追記
-    // （連携フェーズが「前方」または「後方」の未連携列。「返書」単体はPOSTしない）
+    // （連携フェーズが「前方」または「後方」の未連携列のみ。「返書」および登録対象外3分類・未分類はPOSTしない）
     // =========================================================================
     const postCandidateCols = columns.filter((colData) => {
-      if (colData.syncStatus === SANTE_CONFIG.COLUMN_SYNC_STATUS.SYNCED) {
+      if (
+        colData.syncStatus === SANTE_CONFIG.COLUMN_SYNC_STATUS.SYNCED ||
+        colData.syncStatus === SANTE_CONFIG.COLUMN_SYNC_STATUS.EXCLUDED_DONE
+      ) {
         return false;
       }
       return (
@@ -791,11 +865,17 @@ function executeBatchProcess() {
 
     // =========================================================================
     // Step 3: kintone（アプリB）への一括PUT（返書日消込）と年度別台帳更新
-    // （18行目に `kintone#<レコードID>` が入っている列）
-    // ※ 連携フェーズが純粋な「返書（経過・結果報告）」の場合はStep 2をスキップし、本Step 3のみ実行される
+    // （連携フェーズが「返書」または「後方」で、18行目に `kintone#<レコードID>` が入っている列）
+    // ※ 登録対象外3分類・未分類列は18行目にIDがあってもPUTしない
     // =========================================================================
     const putCandidateItems = [];
     columns.forEach((colData) => {
+      if (
+        colData.phase !== SANTE_CONFIG.PHASES.REPLY &&
+        colData.phase !== SANTE_CONFIG.PHASES.BACKWARD
+      ) {
+        return;
+      }
       if (!colData.targetRecordInfo) return;
 
       // 既に返書消込が完了している純粋返書列は二重PUTしない
@@ -855,7 +935,7 @@ function executeBatchProcess() {
       });
     }
 
-    // Step 4: 今回の一括実行でkintone連携・台帳反映が成功した列（および C2:C3）を自動クリア
+    // Step 4: 今回の一括実行で完了した列（同期成功列および登録対象外列）と C2:C3 を自動クリアし、未処理列を左詰め整理
     let autoClearedCount = 0;
     if (syncedColNumbersSet.size > 0) {
       const clearRes = clearSyncedInputColumnsAfterBatch(
@@ -919,6 +999,7 @@ function executeFirstReportGenerationOnly() {
   let count = 0;
 
   columns.forEach((colData) => {
+    if (!colData.phase || isExcludedNoRegisterPhase(colData.phase)) return;
     if (colData.needFirstReport && !colData.reportDocUrl) {
       const res = generateFirstReportDoc(colData, facilityMasterList);
       inputSheet.getRange(rows.REPORT_DOC_URL, colData.colNumber).setValue(res.docUrl);
@@ -994,21 +1075,91 @@ function reRunFiveLockMatchingForAllColumns() {
 }
 
 /**
- * 一括実行（executeBatchProcess）で kintone 送信および年度別連携台帳への反映が成功した列について、
+ * 残存する未処理列スナップショット配列を C列（startCol=3）から左詰めで再配置し、
+ * 入力規則（6分類プルダウン等）・数値書式・15/17行目チェックボックス・セルNote・4行目背景色を保持する共通ヘルパー
+ *
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} inputSheet
+ * @param {Array<{values: Array<Array<*>>, notes: Array<Array<string>>, syncStatus: string}>} remainingColumns
+ * @param {number} numColsToClear C列からクリア対象とする列幅
+ */
+function rewriteRemainingInputColumnsLeft(inputSheet, remainingColumns, numColsToClear) {
+  const startCol = SANTE_CONFIG.INPUT_LAYOUT.DATA_START_COL;
+  const statusRow = SANTE_CONFIG.INPUT_LAYOUT.STATUS_ROW;
+  const rowEnd = SANTE_CONFIG.INPUT_LAYOUT.ROW_END;
+  const totalRows = rowEnd - statusRow + 1; // 4〜19行目 (16行)
+  const rows = SANTE_CONFIG.INPUT_LAYOUT.ROWS;
+
+  if (numColsToClear > 0) {
+    const clearRange = inputSheet.getRange(statusRow, startCol, totalRows, numColsToClear);
+    clearRange.clearContent();
+    clearRange.clearNote();
+    clearRange.clearDataValidations();
+    clearRange.setBackground(null);
+  }
+
+  const remCount = remainingColumns.length;
+  if (remCount > 0) {
+    applyInputColumnValidations(inputSheet, startCol, remCount);
+
+    const newValues = Array.from({ length: totalRows }, () => new Array(remCount).fill(''));
+    const newNotes = Array.from({ length: totalRows }, () => new Array(remCount).fill(''));
+    const needReportOffset = rows.NEED_FIRST_REPORT - statusRow;
+    const faxSentOffset = rows.FAX_SENT - statusRow;
+
+    remainingColumns.forEach((colObj, cIdx) => {
+      for (let r = 0; r < totalRows; r++) {
+        let cellVal = colObj.values[r][0];
+        if (r === needReportOffset || r === faxSentOffset) {
+          cellVal = cellVal === true || String(cellVal).toUpperCase() === 'TRUE';
+        }
+        newValues[r][cIdx] = cellVal;
+        newNotes[r][cIdx] = colObj.notes[r][0];
+      }
+    });
+
+    const targetRange = inputSheet.getRange(statusRow, startCol, totalRows, remCount);
+    targetRange.setValues(newValues);
+    targetRange.setNotes(newNotes);
+
+    // 4行目の背景色を復元
+    for (let cIdx = 0; cIdx < remCount; cIdx++) {
+      const cell = inputSheet.getRange(statusRow, startCol + cIdx);
+      cell.setHorizontalAlignment('center').setFontWeight('bold');
+      const st = remainingColumns[cIdx].syncStatus;
+      if (
+        st === SANTE_CONFIG.COLUMN_SYNC_STATUS.SYNCED ||
+        st === SANTE_CONFIG.COLUMN_SYNC_STATUS.EXCLUDED_DONE
+      ) {
+        cell.setBackground('#d9ead3');
+      } else {
+        cell.setBackground('#fff2cc');
+      }
+    }
+  }
+
+  // 空いた末尾列の15行目・17行目チェックボックスを false にリセット
+  for (let c = startCol + remCount; c < startCol + numColsToClear; c++) {
+    inputSheet.getRange(rows.NEED_FIRST_REPORT, c).setValue(false);
+    inputSheet.getRange(rows.FAX_SENT, c).setValue(false);
+  }
+}
+
+/**
+ * 一括実行（executeBatchProcess）で kintone 送信および年度別連携台帳への反映が成功した列（または登録対象外完了列）について、
  * 4行目ステータス、5〜19行目の値・背景色・セルNote、および C2:C3 貼付セルを自動クリアし、
- * 15行目・17行目のチェックボックスを false にリセットする
- * （エラー列・未処理列・施設名部分一致保留列はそのまま残す）
+ * 15行目・17行目のチェックボックスを false にリセットした上で、
+ * 残った未処理列（部分一致保留・返書ターゲット未特定・連携フェーズ未確定等）を C列開始へ左詰め整理する
  *
  * @param {GoogleAppsScript.Spreadsheet.Sheet=} inputSheet
- * @param {Array<number>} syncedColNumbers 今回同期に成功した1-based列番号配列
- * @return {{clearedCount: number, clearedColumns: Array<number>, pasteRangeCleared: boolean}}
+ * @param {Array<number>} syncedColNumbers 今回完了した1-based列番号配列
+ * @return {{clearedCount: number, clearedColumns: Array<number>, remainingCount: number, pasteRangeCleared: boolean}}
  */
 function clearSyncedInputColumnsAfterBatch(inputSheet, syncedColNumbers) {
   const sheet =
     inputSheet ||
     SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SANTE_CONFIG.SHEETS.INPUT);
   if (!sheet) {
-    return { clearedCount: 0, clearedColumns: [], pasteRangeCleared: false };
+    return { clearedCount: 0, clearedColumns: [], remainingCount: 0, pasteRangeCleared: false };
   }
 
   const pasteRange = sheet.getRange(SANTE_CONFIG.INPUT_LAYOUT.PASTE_RANGE);
@@ -1018,9 +1169,10 @@ function clearSyncedInputColumnsAfterBatch(inputSheet, syncedColNumbers) {
     new Set((syncedColNumbers || []).map((n) => Number(n)).filter((n) => n >= 3))
   );
   if (uniqueCols.length === 0) {
-    return { clearedCount: 0, clearedColumns: [], pasteRangeCleared: true };
+    return { clearedCount: 0, clearedColumns: [], remainingCount: 0, pasteRangeCleared: true };
   }
 
+  const startCol = SANTE_CONFIG.INPUT_LAYOUT.DATA_START_COL;
   const statusRow = SANTE_CONFIG.INPUT_LAYOUT.STATUS_ROW;
   const rowEnd = SANTE_CONFIG.INPUT_LAYOUT.ROW_END;
   const totalRows = rowEnd - statusRow + 1; // 4〜19行目 (16行)
@@ -1037,9 +1189,29 @@ function clearSyncedInputColumnsAfterBatch(inputSheet, syncedColNumbers) {
     sheet.getRange(rows.FAX_SENT, colNum).setValue(false);
   });
 
+  // 残った未処理列があれば C列開始へ左詰め整理する
+  const remainingColsMeta = readAllInputColumns(sheet);
+  const needsLeftPack = remainingColsMeta.some(
+    (colData, idx) => colData.colNumber !== startCol + idx
+  );
+  if (needsLeftPack) {
+    const maxCol = Math.max(sheet.getLastColumn(), ...uniqueCols);
+    const numColsToClear = maxCol >= startCol ? maxCol - startCol + 1 : 0;
+    const remainingSnapshots = remainingColsMeta.map((colData) => {
+      const colRange = sheet.getRange(statusRow, colData.colNumber, totalRows, 1);
+      return {
+        values: colRange.getValues(),
+        notes: colRange.getNotes(),
+        syncStatus: colData.syncStatus,
+      };
+    });
+    rewriteRemainingInputColumnsLeft(sheet, remainingSnapshots, numColsToClear);
+  }
+
   return {
     clearedCount: uniqueCols.length,
     clearedColumns: uniqueCols,
+    remainingCount: remainingColsMeta.length,
     pasteRangeCleared: true,
   };
 }
@@ -1047,7 +1219,7 @@ function clearSyncedInputColumnsAfterBatch(inputSheet, syncedColNumbers) {
 /**
  * 【要件B-4: 送信完了列のクリア機能】
  * 17行目 `✅ FAX送信完了` がチェックされた列、または
- * 15行目 `📝 第一報作成` が FALSE かつ kintone反映が完了した列を安全にクリアし、
+ * 15行目 `📝 第一報作成` が FALSE かつ kintone反映が完了した列（および登録対象外列）を安全にクリアし、
  * 未完了の列を左詰め（C列開始）に整理する
  *
  * @return {{clearedCount: number, remainingCount: number}}
@@ -1073,11 +1245,13 @@ function clearCompletedColumns() {
   let clearedCount = 0;
 
   columns.forEach((colData) => {
-    const isSynced = colData.syncStatus === SANTE_CONFIG.COLUMN_SYNC_STATUS.SYNCED;
-    // FAX送信完了チェック済（かつkintone連携済、またはFAX完了優先）または（第一報不要 かつ kintone反映済）
+    const isSynced =
+      colData.syncStatus === SANTE_CONFIG.COLUMN_SYNC_STATUS.SYNCED ||
+      colData.syncStatus === SANTE_CONFIG.COLUMN_SYNC_STATUS.EXCLUDED_DONE;
+    // FAX送信完了チェック済（かつkintone連携済、または登録対象外）または（第一報不要 かつ 完了済）
     const canClear =
       (colData.faxSent && isSynced) ||
-      (colData.faxSent && colData.phase === SANTE_CONFIG.PHASES.OTHER) ||
+      (colData.faxSent && isExcludedNoRegisterPhase(colData.phase)) ||
       (!colData.needFirstReport && isSynced);
 
     if (canClear) {
@@ -1101,44 +1275,8 @@ function clearCompletedColumns() {
     return { clearedCount: 0, remainingCount: columns.length };
   }
 
-  // C列以降の既存データ領域を一旦クリア
   const numExistingCols = lastCol - startCol + 1;
-  const clearRange = inputSheet.getRange(statusRow, startCol, totalRows, numExistingCols);
-  clearRange.clearContent();
-  clearRange.clearNote();
-  clearRange.clearDataValidations();
-  clearRange.setBackground(null);
-
-  // 未完了の列が残っている場合はC列から左詰めで再配置
-  if (remainingColumns.length > 0) {
-    const remCount = remainingColumns.length;
-    applyInputColumnValidations(inputSheet, startCol, remCount);
-
-    const newValues = Array.from({ length: totalRows }, () => new Array(remCount).fill(''));
-    const newNotes = Array.from({ length: totalRows }, () => new Array(remCount).fill(''));
-
-    remainingColumns.forEach((colObj, cIdx) => {
-      for (let r = 0; r < totalRows; r++) {
-        newValues[r][cIdx] = colObj.values[r][0];
-        newNotes[r][cIdx] = colObj.notes[r][0];
-      }
-    });
-
-    const targetRange = inputSheet.getRange(statusRow, startCol, totalRows, remCount);
-    targetRange.setValues(newValues);
-    targetRange.setNotes(newNotes);
-
-    // 4行目の背景色を復元
-    for (let cIdx = 0; cIdx < remCount; cIdx++) {
-      const cell = inputSheet.getRange(statusRow, startCol + cIdx);
-      cell.setHorizontalAlignment('center').setFontWeight('bold');
-      if (remainingColumns[cIdx].syncStatus === SANTE_CONFIG.COLUMN_SYNC_STATUS.SYNCED) {
-        cell.setBackground('#d9ead3');
-      } else {
-        cell.setBackground('#fff2cc');
-      }
-    }
-  }
+  rewriteRemainingInputColumnsLeft(inputSheet, remainingColumns, numExistingCols);
 
   ss.toast(
     `完了済みの ${clearedCount}列 をクリアし、未完了 ${remainingColumns.length}列 を左詰め整理しました。`,
