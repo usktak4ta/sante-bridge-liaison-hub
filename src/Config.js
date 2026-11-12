@@ -102,6 +102,7 @@ const SANTE_CONFIG = Object.freeze({
     DOC_READY: '📄 第一報作成済（未連携）',
     EXCLUDED_DONE: '✅ 登録対象外（完了）',
     PHASE_UNRESOLVED: '⚠ 連携フェーズ未確定のため保留',
+    VISIT_DATE_UNRESOLVED: '⚠ 受診日未確定のため保留',
   },
 
   // タブ②: 年度別連携台帳 カラム定義（A列〜R列: 全18列）
@@ -395,6 +396,16 @@ function formatDateYMD(value) {
     return `${y}-${m}-${d}`;
   }
   return str;
+}
+
+/**
+ * 受診日を検証付きで YYYY-MM-DD 形式へ正規化する（空または解析不能な文字列の場合は '' を返す）
+ * @param {Date|string|null|undefined} value
+ * @return {string} YYYY-MM-DD または ''
+ */
+function normalizeValidVisitDateYMD(value) {
+  const formatted = formatDateYMD(value);
+  return /^\d{4}-\d{2}-\d{2}$/.test(formatted) ? formatted : '';
 }
 
 /**

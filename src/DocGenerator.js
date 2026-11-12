@@ -66,7 +66,7 @@ function generateFirstReportDoc(recordData, facilityMasterList) {
     : '';
 
   const reportDate = formatDateYMD(new Date());
-  const visitDate = formatDateYMD(recordData.visitDate) || reportDate;
+  const visitDate = normalizeValidVisitDateYMD(recordData.visitDate) || '（受診日未確定）';
   const patientName = String(recordData.patientName || '氏名未入力').trim();
   const visitType = String(recordData.visitType || SANTE_CONFIG.VISIT_TYPES.OUTPATIENT).trim();
 
